@@ -22,3 +22,28 @@ setting is an environment variable, and `N64DK_SAFETY=off` switches all of it of
 Cancelling a job whose workers are mid-build lets the running builds finish their current
 compile; `n64dk jobs --cancel` therefore sends SIGKILL to the whole group after `--grace`
 seconds.
+
+## CI gates
+
+`tools/ci_gates.sh` runs the kit's release gates one at a time: the tracked-file check (no
+SQLite `-wal`/`-shm`/`-journal` file and no `/home/<name>` or `/mnt/<drive>/Users/<name>` path in
+git; the placeholder names in `CI_PATH_PLACEHOLDERS` are allowed), `compileall`, a compile of
+every file by a Python 3.11 interpreter, `operation-schema` (parsed and checked for its protocol,
+fields and core commands), the unit suite, `self-test` (its `ok` field, since the command exits 0
+either way) and `workspace-audit` of the repository (no generated file).
+
+```sh
+sh tools/ci_gates.sh                              # from the repository root or anywhere else
+CI_MEMORY_MAX=3G CI_FAIL_FAST=1 sh tools/ci_gates.sh
+```
+
+Every step runs under `timeout`, `nice` and idle I/O priority, and under a memory cap with swap
+forbidden: a `systemd-run --user --scope -p MemoryMax=... -p MemorySwapMax=0` scope when the
+user manager answers, otherwise an address-space limit (`ulimit -v`, twice the cap).  A step
+does not start with less than `CI_MIN_AVAILABLE_MB` (default 2048) available.  `CI_LOCK=FILE`
+waits for a machine-wide `flock` before the first step (do not set it under a wrapper that holds
+the same lock).  The summary lists every step as PASS, FAIL or SKIP; the exit status is 1 when
+any step failed, 0 only when all passed.  The 3.11 step is skipped without an interpreter
+(`python3.11` on `PATH`, `CI_PY311`, or `CI_PY311_CHECK` naming a static checker script) unless
+`CI_REQUIRE_PY311=1`.  The settings are listed at the top of the script;
+`.github/workflows/ci.yml` runs it with 3.12 and 3.11.

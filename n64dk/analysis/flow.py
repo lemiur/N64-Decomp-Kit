@@ -537,7 +537,8 @@ def find_jump_tables(code: bytes, vram: int, read_word, limit: int = 512) -> dic
     """``jr $reg`` site -> jump-table targets, for use as ``analyse(..., jump_tables=...)``.
 
     Recognises the compiler patterns ``lui X; addu X, X, idx; lw R, lo(X); jr R`` and
-    ``lui X; addiu X, X, lo; addu Y, X, idx; lw R, 0(Y); jr R``.  ``read_word(address)``
+    ``lui X; addiu X, X, lo; addu Y, X, idx; lw R, 0(Y); jr R``, and their 64-bit-register forms
+    (``daddu`` / ``daddiu``, as EGCS emits at -mips3).  ``read_word(address)``
     returns the 32-bit word at a virtual address or None; entries are read while they are
     aligned addresses inside the range."""
     words = [struct.unpack_from(">I", code, i)[0] for i in range(0, len(code) - len(code) % 4, 4)]
@@ -556,9 +557,9 @@ def find_jump_tables(code: bytes, vram: int, read_word, limit: int = 512) -> dic
             for earlier in range(back - 1, max(-1, back - 10), -1):
                 w = words[earlier]
                 op, rs, rt, rd = w >> 26, (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
-                if op == 0 and (w & 0x3F) == 0x21 and rd in wanted:          # addu base, a, b
+                if op == 0 and (w & 0x3F) in (0x21, 0x2D) and rd in wanted:  # (d)addu base, a, b
                     wanted |= {rs, rt}
-                elif op == 9 and rt in wanted and rs in wanted:               # addiu X, X, lo
+                elif op in (9, 25) and rt in wanted and rs in wanted:         # (d)addiu X, X, lo
                     low += (w & 0xFFFF) - (0x10000 if w & 0x8000 else 0)
                 elif op == 15 and rt in wanted:                               # lui X, hi
                     table = (((w & 0xFFFF) << 16) + low + offset) & 0xFFFFFFFF

@@ -161,5 +161,51 @@ class SourceTreeTest(unittest.TestCase):
         self.assertIn("no candidate recipe", self.row["source_trees"][0]["reason"])
 
 
+class EverythingTest(unittest.TestCase):
+    def test_everything_is_the_batch_at_the_kitchen_sink_effort_with_export(self):
+        import argparse
+        from unittest import mock
+        parser = argparse.ArgumentParser()
+        batch.decompile_everything.arguments(parser)
+        args = parser.parse_args(["a.z64", "--out", "/nonexistent/out"])
+        self.assertIsNone(args.effort)
+        with mock.patch.object(batch, "decompile_batch", side_effect=lambda a: (a.effort, a.export)) as run:
+            self.assertEqual(batch.decompile_everything(args), ("exhaustive", True))
+            run.assert_called_once()
+        args = parser.parse_args(["a.z64", "--out", "/nonexistent/out", "--effort", "deep"])
+        with mock.patch.object(batch, "decompile_batch", side_effect=lambda a: a.effort):
+            self.assertEqual(batch.decompile_everything(args), "deep")
+
+
+class BudgetTest(unittest.TestCase):
+    def test_an_effort_mode_sets_the_budget_unless_the_batch_gives_one(self):
+        import argparse
+        self.assertEqual(batch.budget_argv(argparse.Namespace(budget=None, effort=None)), ["--budget", "100"])
+        self.assertEqual(batch.budget_argv(argparse.Namespace(budget=None, effort="exhaustive")), [])
+        self.assertEqual(batch.budget_argv(argparse.Namespace(budget=50, effort="exhaustive")), ["--budget", "50"])
+        parser = argparse.ArgumentParser()
+        batch.decompile_everything.arguments(parser)
+        self.assertIsNone(parser.parse_args(["a.z64", "--out", "/nonexistent/out"]).budget)
+
+
+class ExportTitleTest(unittest.TestCase):
+    def test_a_failed_export_is_recorded_and_never_raised(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            run, tree = Path(tmp) / "t.run", Path(tmp) / "t.export"
+            with mock.patch("n64dk.commands.export.export", side_effect=ValueError("broken")), \
+                    mock.patch("n64dk.commands.runstatus.status", return_value={"ok": 1}):
+                record, status = batch.export_title(Path(tmp), run, tree, None)
+            self.assertEqual((record["out"], status), (str(tree), {"ok": 1}))
+            self.assertIn("ValueError: broken", record["error"])
+            with mock.patch("n64dk.commands.export.export",
+                            return_value={"functions": 3, "matched": 1, "from_c": 1, "out": "x"}) as export, \
+                    mock.patch("n64dk.commands.runstatus.status", side_effect=OSError("gone")):
+                record, status = batch.export_title(Path(tmp), run, tree, "/tc")
+            self.assertEqual(record, {"out": str(tree), "functions": 3, "matched": 1, "from_c": 1})
+            self.assertEqual(export.call_args.kwargs["toolchain"], "/tc")
+            self.assertIn("OSError", status["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

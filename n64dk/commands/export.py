@@ -32,6 +32,12 @@ def _copy(source: Path, target: Path, replacements) -> None:
         shutil.copyfile(source, target)
 
 
+def _unit_class(row: list[str], evidence: dict) -> str:
+    """The unit class of one function-table row: its ``vram`` and ``size`` are hexadecimal text."""
+    from ..analysis import unitclass
+    return unitclass.classify(int(row[2], 16), int(row[4], 16), evidence)
+
+
 def reproduced_by(outcome: str, disassembled: bool) -> str:
     """What reproduces a function in the export.  Only a matched outcome is C; a function the
     export covers with generated (disassembled) assembly is ``assembly (not decompiled)``, never C."""
@@ -124,6 +130,41 @@ def _origin(case) -> str:
     if iterate and iterate[-1].get("final") == 0 and iterate[-1].get("start", 0) > 0:
         return "draft after variant search"
     return "draft"
+
+
+GP_DEPENDENT = "needs the recovered _gp in symbols/gp_symbols.txt"
+
+
+def _recovered_gp(project: Path, run: Path, image: str) -> bool:
+    """Whether the run's small-data lanes were verified against a ``_gp`` recovered from code
+    (``small_data/gp_symbols.txt``) because the project declares none for ``image``."""
+    if not (Path(run) / "small_data" / "gp_symbols.txt").is_file():
+        return False
+    from .run import project_gp
+    try:
+        return project_gp(Path(project), image) is None
+    except Exception:                                    # noqa: BLE001 - unreadable project symbols: the run's file
+        return True                                      # is the only _gp known to have been declared
+
+
+def _how(case, recovered_gp: bool) -> str:
+    """The ``how`` of a function exported with its source: recipe and origin.  One built in a
+    small-data lane against a recovered ``_gp`` says it verifies again only with that file
+    (verification itself is unchanged: strict, relocations included)."""
+    from ..match.pipeline import SMALL_DATA_LANES
+    origin = _origin(case)
+    if recovered_gp and str(case.recipe or "").partition(" ")[0] in SMALL_DATA_LANES:
+        origin = f"{origin}; {GP_DEPENDENT}"
+    return f"{case.recipe} ({origin})"
+
+
+def _gp_note(count: int) -> list[str]:
+    """COVERAGE.md's note on the functions that depend on the recovered ``_gp`` (none: no note)."""
+    if not count:
+        return []
+    return [f"> **Note.** {count:,} of these functions were built in a small-data lane and verified against the `_gp` "
+            "the run recovered from the code that sets `$gp`; the project does not declare it.  They verify again "
+            f"only with `symbols/gp_symbols.txt` (their `how` in `FUNCTIONS.tsv` says \"{GP_DEPENDENT}\").", ""]
 
 
 def _donor_roots(run: Path) -> dict[str, str]:
@@ -232,12 +273,15 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     finally:
         store.close()
     out.mkdir(parents=True, exist_ok=True)
+    from ..match import reasons as reasonsmod
     rows, counts, pending = [], {}, []
     checked: dict[str, str] = {}             # exported C of this run, by its path in the tree
     recipes: dict[str, int] = {}
+    explained = []                 # per row: (case, recorded reason it was not attempted, dossier)
+    gp_dependent = 0               # functions verified against the recovered _gp (symbols/gp_symbols.txt)
     rom_sha1, rom_name, rom_size = None, None, None
     for name in sorted(registry):
-        spec = imagemod.resolve(project, name)
+        spec = imagemod.with_run_catalogue(imagemod.resolve(project, name), run)
         data, delta = spec.load(), spec.delta
         if name == "main" or rom_sha1 is None:
             rom = Path(spec.path)
@@ -263,9 +307,15 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
         scope_file = run / "state" / f"scope_{name}.json"
         left_out = ({int(item["vram"], 16): item["reason"] for item in json.loads(scope_file.read_text())["left_out"]}
                     if scope_file.is_file() else {})
+        dossiers = reasonsmod.load_dossiers(run, name)
+        why_not = {**reasonsmod.load_not_attempted(run, name), **left_out}
+        recovered_gp = _recovered_gp(project, run, name)
         for function, vram, size in spec.rows():
             case = cases.get((name, vram))
             outcome, how, path, score, code_size = "not attempted", left_out.get(vram, ""), "", "", size
+            if vram in donated and proved_beside_waiting_donor(donated[vram][0], case,
+                                                              sources.get((name, vram)) is not None):
+                del donated[vram]
             if vram in donated:
                 outcome, donor, unit, _source_kind = donated[vram]
                 how = f"donor unit {donor}: {unit}"
@@ -284,7 +334,8 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                     if outcome != "assembly":
                         checked[path] = text
                         recipes[case.recipe] = recipes.get(case.recipe, 0) + 1
-                    how = f"{case.recipe} ({_origin(case)})" if outcome != "assembly" else case.recipe
+                    how = _how(case, recovered_gp) if outcome != "assembly" else case.recipe
+                    gp_dependent += int(GP_DEPENDENT in how)
                 elif outcome in ("exact", "awaiting-symbols", "assembly"):
                     outcome = "matched-source-missing"
             counts[outcome] = counts.get(outcome, 0) + 1
@@ -294,12 +345,21 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                     pending.append((name, function, vram, span, data, delta))
             rows.append([name, function, f"0x{vram:08X}", f"0x{vram - delta:X}", f"0x{size:X}", f"0x{code_size:X}",
                          outcome, how, path, score])
+            explained.append((case, why_not.get(vram, ""), dossiers.get(vram)))
         # donor units as the donor stage wrote them (sources, the manifests it proposes, symbols)
         donors = run / name / "donors"
         if donors.is_dir():
             for item in sorted(donors.rglob("*")):
                 if item.is_file() and item.name != "report.json":
                     _copy(item, out / "donors" / name / item.relative_to(donors), replacements)
+            # the origin of every address a donor unit's manifest row pins, as the donor stage recorded it:
+            # receipt replay holds each donor receipt's recorded origins to this record
+            from .verifyreceipt import _donor_origins
+            origins = _donor_origins(donors)
+            if origins:
+                (out / "donors" / name).mkdir(parents=True, exist_ok=True)
+                (out / "donors" / name / "pin_origins.json").write_text(json.dumps(
+                    {f"0x{vram:08X}": found for vram, found in sorted(origins.items())}, indent=1, sort_keys=True) + "\n")
         # a run made before sources of awaiting units were kept: fetch them from the donor itself
         missing = {(donor, unit) for kind, donor, unit, _source_kind in donated.values()
                    if not unit.startswith(("<", "/")) and not (out / "donors" / name / "src" / donor / unit).is_file()}
@@ -315,13 +375,27 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     disassembled = _disassemble(pending, out, project, toolchain) if pending else {}
     reproduced = {"C": 0, "assembly (donor source)": 0, "assembly (hand-written)": 0,
                   "assembly (not decompiled)": 0, "nothing": 0}
-    for row in rows:
+    from ..analysis import unitclass
+    evidence = unitclass.load(project)
+    by_class: dict[str, dict[str, int]] = {}
+    tallies = []                   # (reason code, size) per row: COVERAGE.md's reason table
+    for index, row in enumerate(rows):
         found = None if row[6] in MATCHED else disassembled.get((row[0], int(row[2], 16)))
         kind = reproduced_by(row[6], bool(found))
         if found:
             row[8] = found
         reproduced[kind] += 1
         row.append(kind)
+        # separate output categories: boot, RSP and hand-written units never share a C denominator
+        unit = _unit_class(row, evidence)
+        row.append(unit)
+        by_class.setdefault(unit, {}).setdefault(kind, 0)
+        by_class[unit][kind] += 1
+        # why it is not settled, from the run's own records (empty when settled); explains, never credits
+        case, why, dossier = explained[index]
+        code, step = reasonsmod.explain(row[6], case, unit_class=unit, not_attempted=why, dossier=dossier)
+        row += [code, _scrub(step, replacements)]
+        tallies.append((code, int(row[4], 16)))
     # Identical bytes are not yet a match: every [match] code rule has to pass as well.
     from ..match import coderules
     profile = coderules.Profile.load(project)
@@ -348,22 +422,46 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
         f"{row['name']}\t{row['kind']}\t{row['files']}\t{'yes' if row['conflict'] else 'no'}\t"
         f"{' | '.join(row['declarations'])}\n" for row in coderules.declarations(checked)))
     header = ("image\tfunction\tvram\trom_offset\tsize\tcode_size\toutcome\thow\tsource\tdistance\treproduced_by"
-              "\trules\n")
+              "\tunit_class\treason_code\tnext_step\n")
+    header = header.rstrip("\n") + "\trules\n"       # appended last: every earlier column keeps its position
     (out / "FUNCTIONS.tsv").write_text(header + "".join("\t".join(row) + "\n" for row in rows))
     (out / "MATCHED.tsv").write_text(header + "".join("\t".join(row) + "\n" for row in rows if row[6] in MATCHED))
     for item in sorted((run / "queue").glob("*")) if (run / "queue").is_dir() else []:
         if item.is_file():
             _copy(item, out / "manifests" / item.name, replacements)
     survey = project / "survey"
+    # an image the run resolved against its own catalogue (repaired or corrected): the export carries that one
+    run_catalogues = {}
+    for name in registry:
+        spec = imagemod.resolve(project, name)
+        used = imagemod.with_run_catalogue(spec, run).catalogue
+        if spec.catalogue and used and Path(used).resolve() != Path(spec.catalogue).resolve():
+            run_catalogues[Path(spec.catalogue).resolve()] = Path(used)
     for item in sorted(survey.glob("*")) if survey.is_dir() else []:
         if item.is_file() and item.suffix in (".txt", ".toml", ".json", ".tsv", ".md"):
             folder = "symbols" if item.name.startswith(("symbol_addrs", "sdk_symbols")) else "config"
-            _copy(item, out / folder / item.name, replacements)
+            _copy(run_catalogues.get(item.resolve(), item), out / folder / item.name, replacements)
     if (project / "n64dk.toml").is_file():
         _copy(project / "n64dk.toml", out / "config" / "n64dk.toml", replacements)
+    # the program's _gp the run recovered from the code that sets $gp (small data): every function
+    # verified with a GP-relative relocation needs it declared to verify again
+    if (run / "small_data" / "gp_symbols.txt").is_file():
+        _copy(run / "small_data" / "gp_symbols.txt", out / "symbols" / "gp_symbols.txt", replacements)
     for item in ("report.md", "report.json"):
         if (run / item).is_file():
             _copy(run / item, out / "report" / item, replacements)
+    # the unresolved dossier (n64dk.match.dossier): the run's own, else derived from the run's records
+    # (read-only: a run made before decompile-run wrote it); UNRESOLVED.md renders it
+    from ..match import dossier as dossiermod
+    try:
+        unresolved = dossiermod.load(run) or dossiermod.collect(run, project=project)
+        (out / "report").mkdir(parents=True, exist_ok=True)
+        (out / "report" / dossiermod.FILE).write_text(_scrub(json.dumps(unresolved, separators=(",", ":")),
+                                                             replacements) + "\n")
+        (out / "UNRESOLVED.md").write_text(_scrub(dossiermod.markdown(unresolved), replacements))
+        unresolved = {key: unresolved["summary"][key] for key in ("functions", "bytes", "by_retry")}
+    except Exception as error:                               # noqa: BLE001 - a report, never the export's failure
+        unresolved = {"error": f"{type(error).__name__}: {error}"[-300:]}
     total = len(rows)
     matched = sum(counts.get(key, 0) for key in MATCHED)
     from_c = matched - counts.get("assembly", 0) - counts.get("donor-assembly", 0) - \
@@ -409,9 +507,14 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
     readme += ["", "## Layout", "",
                "- `FUNCTIONS.tsv`: every function with its address, size, outcome, recipe and source file.  `size` is",
                "  the catalogue's span (it may end in alignment padding); `code_size` is what the source reproduces.",
+               "  `reason_code` and `next_step` say why a function is not settled and what would settle it",
+               "  (empty when it is settled; `COVERAGE.md` counts the codes).",
                "  `rules` says whether identical bytes count: `pass`, `MATCH-PENDING: <rules>`, `ORIGINAL-ASM` or",
                "  `unchecked (donor)`.",
                "- `MATCHED.tsv`: the byte-identical ones only (read `rules` before counting one as matched).",
+               "- `UNRESOLVED.md`: every function not settled with its reason, the techniques tried on it, the",
+               "  eligible next ones at their measured cost, and the evidence that would justify a retry",
+               "  (`report/unresolved_dossier.json` holds it in full).",
                "- `RULES.tsv`: every code-rule finding in the exported C, [match] and advisory.",
                "- `DECLARATIONS.tsv`: every `extern` by name, with each way it is declared and in how many files.",
                "- `AGENTS.md`: the project profile the code rules read (dialect, naming, commands, rule changes).",
@@ -425,6 +528,8 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                "- `donors/<image>/`: library and shared units the donor stage verified: their sources, the manifest rows",
                "  it proposes (`proposed_*.tsv`), the symbols it transferred, and what still awaits symbols.",
                "- `manifests/`: recipe of every exported function (`queue.tsv` exact, `assumed.tsv`, `assembly.tsv`).",
+               "- `symbols/gp_symbols.txt` (small-data titles only): the program's `_gp`, recovered from the code that",
+               "  sets `$gp`; declare it with the other symbol files when verifying functions built at `-G8`.",
                "- `symbols/`, `config/`: symbol files, the function catalogue, the project configuration, the ROM layout.",
                "- `report/`: the run's own report.", "",
                "Each source is a single function with the declarations the decompiler needed; names are addresses",
@@ -446,12 +551,20 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                "n64dk match --project project --addr VRAM --size SIZE --pipeline PIPELINE --flags=\"FLAGS\" src/main/FUNCTION.c",
                "```", "", "with `VRAM`, `SIZE` (the row's `code_size`), pipeline and flags taken from the function's row in `FUNCTIONS.tsv`.", ""]
     coverage = rom_coverage(project / "survey" / "ledger.tsv", rom_size)
-    lines = [f"# Coverage: {name}", "", "## Functions", "",
+    warning = _denominator_warning(run)
+    lines = [f"# Coverage: {name}", "", *([f"> **Warning.** {warning}", ""] if warning else []), "## Functions", "",
              "| reproduced by | functions |", "|---|---:|",
              *[f"| {kind} | {count:,} |" for kind, count in reproduced.items()],
-             f"| **all** | **{total:,}** |", "",
+             f"| **all** | **{total:,}** |", "", *_gp_note(gp_dependent),
              "Every function has a source that gives back its bytes when the last row is 0.  Only the first row is",
-             "decompilation; the third is disassembly kept so that nothing is left out.", ""]
+             "decompilation; the third is disassembly kept so that nothing is left out.", "",
+             "## By unit class", "",
+             "Boot code, RSP microcode, hand-written routines, SDK library code and game code are counted apart",
+             "(`unit_class` in `FUNCTIONS.tsv`); no figure combines them.", "",
+             "| unit class | " + " | ".join(reproduced) + " |", "|---" * (len(reproduced) + 1) + "|",
+             *[f"| {unit} | " + " | ".join(f"{by_class.get(unit, {}).get(kind, 0):,}" for kind in reproduced) + " |"
+               for unit in unitclass.CLASSES if unit in by_class], ""]
+    lines += reasonsmod.table(tallies)
     if coverage:
         size = coverage["rom_bytes"] or 1
         lines += ["## Every byte of the ROM", "",
@@ -466,12 +579,44 @@ def export(project: Path, run: Path, out: Path, title: str | None = None, cover:
                       *[f"| {row['start']}..{row['end']} | {row['bytes']:,} | {row['evidence']} |"
                         for row in coverage["largest_unclassified"]], ""]
     (out / "COVERAGE.md").write_text("\n".join(lines))
+    if warning:
+        readme[2:2] = [f"> **Warning.** {warning}", ""]
     (out / "README.md").write_text("\n".join(readme))
     return {"title": name, "rom_sha1": rom_sha1, "functions": total, "matched": matched, "from_c": from_c,
             "code_rules": rules,
             "reproduced_by": reproduced, "rom": coverage and {k: coverage[k] for k in (
                 "rom_bytes", "rows", "gap_bytes", "overlap_bytes", "bytes_by_class", "unclassified_ranges")},
-            "counts": {key: counts[key] for key in order if counts.get(key)}, "out": str(out)}
+            "counts": {key: counts[key] for key in order if counts.get(key)}, "unit_classes": by_class,
+            "reasons": reasonsmod.summary(tallies), "unresolved": unresolved, "out": str(out)}
+
+
+def _denominator_warning(run: Path) -> str | None:
+    """The run's discovery verdict, when its catalogue is not known to be complete: every count in
+    the export is over the catalogue, which then is not the title's code."""
+    import json as _json
+    report = Path(run) / "report.json"
+    try:
+        found = (_json.loads(report.read_text()).get("discovery") or {}) if report.is_file() else {}
+    except ValueError:
+        return None
+    verdict = found.get("verdict")
+    if verdict == "incomplete":
+        return found.get("warning") or ("the function catalogue is incomplete: every count and percentage here is "
+                                        "over the catalogue, not over the title's code")
+    if verdict == "doubtful":
+        return ("the function catalogue's completeness is doubtful (weak evidence either way): counts and "
+                "percentages here are over the catalogue, which may miss code")
+    return None
+
+
+def proved_beside_waiting_donor(donor_outcome: str, case, has_source: bool) -> bool:
+    """Whether a function inside a donor unit is credited to the resolver's own proof instead.
+
+    Only when the donor unit still waits for an address (it recovers nothing yet) and the resolver's case is
+    strictly proved (``exact`` or hand-written ``assembly``) with its source stored.  A verified donor unit
+    keeps its functions; a case that is itself only byte-identical with assumed addresses changes nothing."""
+    return (donor_outcome.endswith("awaiting-symbols") and case is not None
+            and getattr(case, "status", None) in ("exact", "assembly") and has_source)
 
 
 @command("decompile-export", "Write a finished decompile-run as a tree ready to commit: one source per matched "

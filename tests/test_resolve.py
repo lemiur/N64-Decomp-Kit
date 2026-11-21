@@ -59,6 +59,34 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(stages[4], "iterate")
         self.assertIn("exact-found", [e["event"] for e in events])
 
+    def test_rewrites_are_tried_on_the_best_source_the_search_ends_with(self):
+        """The recipe's rewrites match from what the search made of the draft, not only from the draft."""
+        def evaluate(text):
+            exact = "/* rewritten */" in text
+            outcome = {"proof": {"verdict": "exact"}} if exact else None
+            return iterate.Evaluation(0 if exact else 5, exact, {"counts": {} if exact else {"register": 2}, "entries": []},
+                                      outcome=outcome), (TARGET if exact else WRONG)
+        seen = []
+
+        def rewrites(text):
+            seen.append(text)
+            return [("worse", text + "/* same */"), ("fix", text + "/* rewritten */")]
+        case = resolve.resolve(self.store, "main", "read", BASE, TARGET, evaluate, source=SOURCE, jobs=1, budget=60,
+                               rewrites=rewrites)
+        self.assertEqual(case.status, "exact")
+        self.assertEqual(len(seen), 1)
+        self.assertIn("/* rewritten */", self.store.source(case.best_digest))
+        stage = [s for s in case.stages if s["stage"] == "rewrite-best"][0]
+        self.assertEqual((stage["tried"], stage["start"], stage["final"]), (2, 5, 0))
+
+    def test_rewrites_that_do_not_help_leave_the_best_source(self):
+        def evaluate(text):
+            return iterate.Evaluation(7 if "/* worse */" in text else 5, False, {"counts": {"register": 2}, "entries": []}), WRONG
+        case = resolve.resolve(self.store, "main", "read", BASE, TARGET, evaluate, source=SOURCE, jobs=1, budget=60,
+                               rewrites=lambda text: [("worse", text + "/* worse */")])
+        self.assertNotIn("/* worse */", self.store.source(case.best_digest))
+        self.assertEqual(case.best_score, 5)
+
     def test_exact_case_is_not_recomputed(self):
         calls = []
         resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate(calls), source=SOURCE, jobs=1)
@@ -86,6 +114,22 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("mfc0", self.store.source(case.best_digest))
         self.assertEqual(case.strict.get("verdict"), "exact")
         self.assertIn("gnu-as", case.recipe)
+
+    def test_a_section_placed_by_its_contents_is_part_of_the_exported_recipe(self):
+        import pathlib
+        placed = {"verdict": "exact", "assumptions": [], "corroborated": {".rodata": "0x80000E40"}}
+        case = resolve.resolve(self.store, "main", "read", BASE, TARGET, fake_evaluate([], proof=False), source=SOURCE,
+                               jobs=1, strict=lambda text, recipe: dict(placed), recipe_label="kmc+asn64 -O0 -G0",
+                               rom_offset=0x1000)
+        self.assertEqual(case.status, "exact")
+        out = pathlib.Path(_scratch("n64dk-queue-test-"))
+        resolve.export_queue(self.store, out)
+        row = [line for line in (out / "queue.tsv").read_text().splitlines() if "main/read.c" in line][0]
+        # the recipe stays as verified (a receipt rebuilds under it); the placement a link needs is listed beside it
+        self.assertEqual(row.split("\t")[3], "-O0 -G0")
+        placed = [line.split("\t") for line in (out / "placed_sections.tsv").read_text().splitlines()
+                  if not line.startswith("#")]
+        self.assertEqual(placed, [["main", f"0x{BASE:08X}", ".rodata", "0x80000E40", "section-content"]])
 
     def test_assembly_is_exported_beside_the_queue_and_not_in_it(self):
         import pathlib

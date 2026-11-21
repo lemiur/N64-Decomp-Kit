@@ -276,6 +276,35 @@ def offer_trees(row: dict, trees: list[Path], out: Path, donors: str | None, too
     return True
 
 
+LEGACY_BUDGET = 100                  # the batch's builds per function before effort modes reached it
+
+
+def budget_argv(args) -> list[str]:
+    """``--budget`` for each title's run: the batch's own when given; otherwise the effort mode's
+    (exhaustive: 400), and the batch's historical 100 only when no mode is chosen."""
+    budget = getattr(args, "budget", None)
+    if budget is None and not getattr(args, "effort", None):
+        budget = LEGACY_BUDGET
+    return [] if budget is None else ["--budget", str(budget)]
+
+
+def export_title(project: Path, run: Path, tree: Path, toolchain: str | None) -> tuple[dict, dict]:
+    """A finished run's export tree and status table.  A failure is recorded, never raised: the
+    run itself succeeded, so the title is not failed and the batch goes on."""
+    from .export import export as export_tree
+    from .runstatus import status as run_status
+    try:
+        record = {"out": str(tree), **{k: v for k, v in export_tree(project, run, tree, toolchain=toolchain).items()
+                                       if k in ("functions", "matched", "from_c")}}
+    except Exception as error:                               # noqa: BLE001 - a report, never a reason to stop
+        record = {"out": str(tree), "error": f"{type(error).__name__}: {error}"[-300:]}
+    try:
+        status = run_status(run, None, 3)
+    except Exception as error:                               # noqa: BLE001 - a report, never a reason to stop
+        status = {"error": f"{type(error).__name__}: {error}"[-300:]}
+    return record, status
+
+
 @command("decompile-batch", "Run decompile-init and decompile-run over a set of ROMs, one at a time, sharing every "
                             "strictly exact function between them through a library")
 def decompile_batch(args):
@@ -320,7 +349,7 @@ def _decompile_batch(args):
         parser = argparse.ArgumentParser()
         decompile_run.arguments(parser)
         argv = ["--project", row["project"], "--all-images", "--out", row["run"], "--library", str(library),
-                "--budget", str(args.budget)]
+                *budget_argv(args)]
         if args.max_size:
             argv += ["--max-size", hex(args.max_size)]
         if getattr(args, "search_economics", False):
@@ -335,6 +364,8 @@ def _decompile_batch(args):
             argv += ["--refine-command", args.refine_command]
         if args.refine_jobs:
             argv += ["--refine-jobs", str(args.refine_jobs)]
+        if getattr(args, "effort", None):
+            argv += ["--effort", args.effort]
         return parser.parse_args(argv)
 
     trees = [Path(tree).resolve() for tree in (getattr(args, "source_tree", None) or [])]
@@ -364,6 +395,11 @@ def _decompile_batch(args):
                     row["diagnosis"] = diagnosis(Path(row["run"]), images)
                 except Exception:                            # noqa: BLE001 - a report, never a reason to stop
                     row["diagnosis"] = None
+                if getattr(args, "export", False):
+                    # the tree ready to commit, and the run's status table beside it
+                    row["export"], row["status"] = export_title(
+                        project, Path(row["run"]), out / f"{row['title']}.export",
+                        args.toolchain_dir or os.environ.get("N64DK_TOOLCHAIN"))
                 row.pop("error", None)
             except (Exception, SystemExit) as error:        # one title must not stop the others
                 row["error"] = f"pass {number}: {error}"[-300:]
@@ -402,7 +438,8 @@ def _args(p):
     p.add_argument("--toolchain-dir", help="toolchain root (default: N64DK_TOOLCHAIN)")
     p.add_argument("--calibrate", type=int, default=96,
                    help="functions sampled per title to measure its recipe")
-    p.add_argument("--budget", type=int, default=100, help="maximum builds per function")
+    p.add_argument("--budget", type=int, default=None,
+                   help="maximum builds per function (default: the --effort mode's, or 100 without --effort)")
     p.add_argument("--max-size", type=lambda s: int(s, 0), default=0, help="largest function attempted (0: no limit)")
     p.add_argument("--search-economics", action="store_true",
                    help="stop searching strata whose searches have returned nothing (see decompile-run)")
@@ -412,6 +449,10 @@ def _args(p):
     p.add_argument("--init-timeout", type=int, default=1800,
                    help="seconds one title's survey may take before it is reported as failed (0: no limit)")
     p.add_argument("--force-init", action="store_true", help="survey every ROM again even when its project exists")
+    p.add_argument("--effort", choices=("quick", "normal", "deep", "exhaustive"),
+                   help="decompile-run effort mode of every title (default: decompile-run's)")
+    p.add_argument("--export", action="store_true",
+                   help="after each title's run, write its export tree (<out>/<title>.export) and status")
 
 
 def _all_args(p):
@@ -421,3 +462,15 @@ def _all_args(p):
 
 
 decompile_batch.arguments = _all_args
+
+
+@command("decompile-everything", "Everything the kit can do for a set of ROMs: init, run at the kitchen-sink effort "
+                                 "(exhaustive), library sharing, export and status, one title at a time, resumable")
+def decompile_everything(args):
+    """``decompile-batch`` with ``--effort exhaustive`` and ``--export`` unless given otherwise."""
+    args.effort = args.effort or "exhaustive"
+    args.export = True
+    return decompile_batch(args)
+
+
+decompile_everything.arguments = _all_args

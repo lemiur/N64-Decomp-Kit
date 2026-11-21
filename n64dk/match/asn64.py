@@ -63,18 +63,49 @@ def _expand_memory(identifier: str, operand_text: str, disabled, enabled) -> tup
     m = CONST_BASE_RE.match(address)
     if m and (identifier in INT_LOADS or identifier in INT_STORES) and "MEM-BIG-CONST" not in disabled:
         offset, base = int(m.group(1)), m.group(2)
-        if not (0x8000 <= offset <= 0xFFFF):
+        if not (0x8000 <= offset <= 0x7FFF7FFF):               # past 0xFFFF too (Wheel of Fortune: lw 0x1E478(reg))
             return None
         low = ((offset & 0xFFFF) ^ 0x8000) - 0x8000
         high = ((offset - low) >> 16) & 0xFFFF
         return ((f"\t.set noat\n\tlui $at,{high:#x}\n\taddu $at,{base},$at\n"
                  f"\t{identifier} {target},{low}($at)\n\t.set at\n"), 3)
+    if "FP32-PAIR" in enabled and identifier in ("l.d", "s.d") and re.fullmatch(r"\$f\d+", target):
+        # 32-bit float registers (``-mfp32``): a double is moved a word at a time, the odd register (its
+        # high word) first, through one ``lui`` (the title's objects show ``lui $at; lwc1 $f3,lo; lwc1 $f2,lo+4``)
+        number = int(target[2:])
+        op = "lwc1" if identifier == "l.d" else "swc1"
+        m = SYM_BASE_RE.match(address)
+        if m:
+            sym, base = m.group(1), m.group(2)
+            return ((f"\t.set noat\n\tlui $at,%hi({sym})\n\taddu $at,$at,{base}\n"
+                     f"\t{op} $f{number + 1},%lo({sym})($at)\n\t{op} $f{number},%lo({sym}+4)($at)\n\t.set at\n"), 4)
+        if BARE_SYM_RE.match(address):
+            return ((f"\t.set noat\n\tlui $at,%hi({address})\n"
+                     f"\t{op} $f{number + 1},%lo({address})($at)\n\t{op} $f{number},%lo({address}+4)($at)\n"
+                     "\t.set at\n"), 3)
+        m = CONST_BASE_RE.match(address)
+        if m and -0x8000 <= int(m.group(1)) < 0x7FFC:
+            offset, base = int(m.group(1)), m.group(2)
+            return (f"\t{op} $f{number + 1},{offset}({base})\n\t{op} $f{number},{offset + 4}({base})\n", 2)
+        return None
     if ("KMC-ABS-SYM-PAIR" in enabled and BARE_SYM_RE.match(address)
             and (identifier in INT_LOADS or identifier in INT_STORES)):
         base = target if identifier in INT_LOADS else "$at"
         return ((f"\t.set noat\n\tlui {base},%hi({address})\n"
                  f"\t{identifier} {target},%lo({address})({base})\n\t.set at\n"), 2)
     return None
+
+
+def _fp32(source: str) -> bool:
+    """Whether the compiler that wrote ``source`` ran with ``-mfp32`` (the last of ``-mfp32``/``-mfp64`` on the
+    ``Cc1 arguments`` line GCC writes at the head of its output)."""
+    head = source[:4000]
+    at = head.find("# Cc1 arguments")
+    if at < 0:
+        return False
+    stop = head.find("\n\n", at)
+    modes = re.findall(r"-mfp(32|64)\b", head[at:stop if stop >= 0 else len(head)])
+    return bool(modes) and modes[-1] == "32"
 
 
 def _div_expansion(kind: str, ops: list[str], label: int) -> tuple[str, int]:
@@ -2679,6 +2710,25 @@ def convert(source: str, disabled: frozenset[str] | set[str] = frozenset(),
                             f"{load}"
                             "\t.set\tat\n")
                     generated += 1
+                elif identifier == "li.d" and "FP32-PAIR" in enabled and re.fullmatch(r"\$\d+", ops[0]):
+                    # a double constant for an integer register pair (an argument in $a2/$a3): the low word
+                    # is loaded first (the title's objects show ``addiu $a3,$zero,0; lui $a2,high``)
+                    bits = struct.unpack(">Q", struct.pack(">d", float(ops[1])))[0]
+                    number = int(ops[0][1:])
+                    if bits & 0xFFFFFFFFFFFF == 0 and bits:
+                        line = f"\taddiu ${number + 1},$0,0\n\tlui ${number},{bits >> 48:#x}\n"
+                        emitted_instruction_count = 2
+                    elif bits >> 48 and (bits >> 16) & 0xFFFF:
+                        # both words need their upper half: each is ``lui`` and, when the lower half is not
+                        # zero, ``ori``; still the low word first (a title's ``lui $a3,0x9999; ori $a3,$a3,0x999A;
+                        # lui $a2,0x3FE9; ori $a2,$a2,0x9999`` for 0.8)
+                        line, emitted_instruction_count = "", 0
+                        for register, word in ((number + 1, bits & 0xFFFFFFFF), (number, bits >> 32)):
+                            line += f"\tlui ${register},{word >> 16:#x}\n"
+                            emitted_instruction_count += 1
+                            if word & 0xFFFF:
+                                line += f"\tori ${register},${register},{word & 0xFFFF:#x}\n"
+                                emitted_instruction_count += 1
             elif identifier in "div" or identifier in "divu" or identifier == "rem" or (
                     identifier == "remu" and "REMU-EXPAND" not in disabled):
                 kind = "div" if identifier in "div" else "divu" if identifier in "divu" else identifier

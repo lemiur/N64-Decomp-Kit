@@ -19,7 +19,8 @@ Everything is derived from the ROM image and the boot analysis:
    add starts where they land on a gap or on a split point (just after a terminator and
    its delay slot), never on jump-table targets.
 7. Jump tables are recognised from ``lui``/``addiu``|``lw`` + ``addu`` + ``jr reg``
-   with the ``sltiu`` bound when present.
+   with the ``sltiu`` bound when present.  The index addition may be ``daddu``: EGCS
+   with 64-bit registers (``-mips3`` without ``-mgp32``) adds the scaled index that way.
 
 Boundary findings (late starts, interior aliases, shared epilogues, cross-function
 branches, fall-through) can be computed for the discovered catalogue or for any
@@ -71,6 +72,7 @@ class Body:
     fell_through: bool = False
     calls: set = field(default_factory=set)
     tails: set = field(default_factory=set)
+    bals: set = field(default_factory=set)     # calls by a linking branch (hand-written code)
     cross: list = field(default_factory=list)  # (site, target) branches leaving [start, limit)
     tables: list = field(default_factory=list)
 
@@ -85,6 +87,7 @@ class Function:
     seed: str = "call"  # entry, call, tail, pointer, data_pointer, sweep
     frame: int = 0
     flags: list = field(default_factory=list)
+    reasons: list = field(default_factory=list)   # HANDWRITTEN_REASONS that made it ``asm``
 
     @property
     def size(self) -> int:
@@ -213,7 +216,7 @@ def _simm(ins) -> int:
     return v - 0x10000 if v & 0x8000 else v
 
 
-WEAK_SEEDS = ("tail", "pointer", "data_pointer", "sweep", "prologue")     # starts no call vouches for
+WEAK_SEEDS = ("tail", "pointer", "data_pointer", "sweep", "prologue", "branch")     # starts no call vouches for
 JR_RA = 0x03E00008
 
 
@@ -274,6 +277,8 @@ class Analyser:
         img = self.img
         body = Body(start, start)
         pc, furthest = start, start
+        known: dict[int, int] = {}          # registers holding an address computed from a PC read
+        derived: set[int] = set()           # every such address (passed on to local subroutines)
         while pc < limit:
             if not img.valid(pc, strict):
                 body.ok, body.reason, body.end = False, f"invalid instruction at 0x{pc:08X}", pc
@@ -281,12 +286,38 @@ class Analyser:
             ins = img.ins(pc)
             name = ins.getOpcodeName()
             target = _branch_target(ins)
+            # Hand-written code reads its own address (``bltzal $zero`` / ``bal``: $ra = pc + 8) and
+            # calls ``jalr`` an address computed from it: a call like any other.
+            if name == "jalr" and (mips.reg(ins.rs) in known or derived):
+                # the register's own value, or (set before a bal into the subroutine holding this
+                # jalr) any address the routine computed from its PC
+                for local in ([known[mips.reg(ins.rs)]] if mips.reg(ins.rs) in known else sorted(derived)):
+                    if start <= local < limit:
+                        furthest = max(furthest, local)
+                    elif local in img:
+                        body.calls.add(local)
+                        body.bals.add(local)
+            written = _written(ins)
+            if written is not None:
+                known.pop(written, None)
+            if target is not None and ins.isBranch() and ins.doesLink():
+                known[mips.RA] = pc + 8
+            elif name in ("addiu", "daddiu") and mips.reg(ins.rs) == mips.RA and mips.RA in known and written:
+                known[written] = (known[mips.RA] + _simm(ins)) & 0xFFFFFFFF
+                derived.add(known[written])
             if target is not None:
                 if ins.doesLink():
                     if ins.isJumpWithAddress():
                         body.calls.add(target)
+                    elif ins.getOpcodeName() in ("bltzal", "bltzall") and mips.reg(ins.rs) == 0:
+                        pass                       # never taken: only reads the PC (often of a table)
                     elif start <= target < limit:  # bal / bgezal: local subroutine in asm
                         furthest = max(furthest, target)
+                    else:
+                        # bal into another routine: a call all the same (``bltzal $zero`` is never
+                        # taken: it only reads the PC, and its target is often a constant table)
+                        body.calls.add(target)
+                        body.bals.add(target)
                 elif start <= target < limit:
                     furthest = max(furthest, target)
                 elif ins.isJumpWithAddress():
@@ -323,7 +354,11 @@ class Analyser:
         return body
 
     def jump_table(self, start: int, jr_pc: int) -> JumpTable | None:
-        """Recover ``lui``/(``addiu``)/``addu``/``lw``/``jr`` table dispatch ending at ``jr_pc``."""
+        """Recover ``lui``/(``addiu``)/``addu``|``daddu``/``lw``/``jr`` table dispatch ending at ``jr_pc``.
+
+        ``daddu``: EGCS 1.1.2 at ``-O2 -mips3`` (64-bit registers) dispatches through
+        ``sltiu; beqz; sll; lui; daddu; lw %lo; jr``.  Missing it left the table words to the
+        data-pointer seeds, which split every case label after a ``jr ra`` into a function."""
         img = self.img
         if jr_pc in self.tables:
             return self.tables[jr_pc]
@@ -338,11 +373,11 @@ class Analyser:
             value = kind = None
             if name == "lui":
                 value, kind = (ins.getImmediate() << 16) & 0xFFFFFFFF, "c"
-            elif name == "addiu" and mips.reg(ins.rs) in consts:
+            elif name in ("addiu", "daddiu") and mips.reg(ins.rs) in consts:   # la at -mips3: lui; daddiu
                 value, kind = (consts[mips.reg(ins.rs)] + _simm(ins)) & 0xFFFFFFFF, "c"
             elif name == "ori" and mips.reg(ins.rs) in consts:
                 value, kind = consts[mips.reg(ins.rs)] | ins.getImmediate(), "c"
-            elif name == "addu":
+            elif name in ("addu", "daddu"):
                 rs, rt = mips.reg(ins.rs), mips.reg(ins.rt)
                 if rs in consts or rt in consts:
                     value, kind = consts.get(rs, consts.get(rt)), "b"
@@ -446,8 +481,19 @@ class Analyser:
                     if seeds_ok(t) and self.img.valid(t) and self.split_point(t) and self.add(t, "tail"):
                         new = True
             self.bodies = bodies
+            # A weak start in the delay slot of the code before it is that code's delay slot.
+            for i, s in enumerate(ordered[1:], 1):
+                before = bodies.get(ordered[i - 1])
+                if (self.starts.get(s) in WEAK_SEEDS and before is not None and before.ok and before.end == s
+                        and before.fell_through and self.img.ins(s - 4).hasDelaySlot()):
+                    self.findings.append(Finding(s, "rejected_start", f"{self.starts[s]} seed: a delay slot"))
+                    self.rejected.add(s)
+                    del self.starts[s]
+                    new = True
             # Drop weak starts whose walk hits invalid code (calls into data, misread tails).
             for s, b in bodies.items():
+                if s not in self.starts:
+                    continue
                 weak = self.starts.get(s) in WEAK_SEEDS
                 if weak and (not b.ok or (b.fell_through and self.starts[s] == "sweep" and s not in self.evidence)):
                     reason = b.reason or "falls into the next function"
@@ -524,9 +570,11 @@ class Analyser:
                 return cand, b
         return None
 
-    def find_text_end(self) -> int:
+    def find_text_end(self, sweep: bool = True) -> int:
         ends = [b.end for s, b in self.bodies.items() if b.ok or self.starts.get(s) == "entry"]
         top = max(ends)
+        if not sweep:
+            return top
         refs = self.code_refs()
         data_refs = sorted(r.address for r in refs if r.kind in ("load", "store") and r.address >= top)
         # a data reference may point past the loaded image (bss): the sweep stops at the image's end
@@ -572,11 +620,14 @@ class Analyser:
             if v in self.starts or v in self.table_targets or not (self.text_lo <= v < self.text_hi) or v % 4:
                 continue
             if any(a <= v < b for a, b in self.data_regions):
-                continue
+                # Bytes the sweep took for data are code after all when code branches to them, or
+                # an address pair in code names them and they walk without a junk word.
+                if seed not in ("branch", "pointer") or (seed == "pointer" and _junk_prefix(self.img, v, v + 4)):
+                    continue
             i = bisect.bisect_right(ordered, v) - 1
             inside = i >= 0 and v < self.bodies.get(ordered[i], Body(0, 0)).end
-            if inside and not self.split_point(v):
-                continue
+            if inside and (seed == "branch" or not self.split_point(v)):
+                continue                        # a branch into a body is a shared tail, not a start
             if not inside and self.img.word(v) == 0:
                 continue
             if self.walk(v, self.limit_for(v, ordered), strict=True).ok and self.add(v, seed):
@@ -647,6 +698,10 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
             an.sweep_gaps(data_hits)
             an.grow(lambda v: v < text_end)
             candidates: dict[int, str] = {}
+            for b in list(an.bodies.values()):
+                if b.ok:
+                    for _, t in b.cross:
+                        candidates.setdefault(t, "branch")
             for r in refs:
                 if r.kind == "addr" and an.text_lo <= r.address < text_end:
                     candidates.setdefault(r.address, "pointer")
@@ -662,7 +717,7 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
         # Recovery: calls from accepted code that land past the text end mean CPU code
         # continues after an embedded non-CPU block (e.g. RSP microcode linked into .text).
         # Extend the text and run the phases again; the block becomes in-text data.
-        beyond = _calls_beyond(an, text_end)
+        beyond, agreed = _calls_beyond(an, text_end)
         if not beyond:
             break
         old_end = text_end
@@ -670,7 +725,8 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
         for t in beyond:
             an.add(t, "call")
         an.grow()
-        text_end = max(text_end, an.find_text_end())
+        # Code found from one call ends where what it reaches ends: no sweep beyond it.
+        text_end = max(text_end, an.find_text_end(sweep=agreed))
         if text_end <= old_end:
             break
         extensions.append(Finding(old_end, "text_extended",
@@ -688,18 +744,24 @@ def discover(rom: Rom, info: bootmod.BootInfo | None = None, program=None, seeds
     return cat
 
 
-def _calls_beyond(an: Analyser, text_end: int) -> list[int]:
+def _calls_beyond(an: Analyser, text_end: int) -> tuple[list[int], bool]:
     """Call targets past ``text_end`` from successfully walked functions that themselves walk
-    as functions; empty unless at least two call sites agree (one stray ``jal`` read from
-    data must not move the text end)."""
+    as functions, and whether two call sites agree (one stray ``jal`` read from data must not
+    move the text end).  A single call counts only when its target opens a stack frame and walks
+    strictly to a return (``False``: the text then ends where that code ends)."""
     sites: dict[int, int] = {}
     for s, b in an.bodies.items():
         if s < text_end and b.ok:
             for t in b.calls:
                 if text_end <= t < an.img.end and t % 4 == 0:
-                    sites[t] = sites.get(t, 0) + 1
-    good = [t for t in sorted(sites) if an.img.valid(t) and an.walk(t, an.img.end).ok]
-    return good if sum(sites[t] for t in good) >= 2 else []
+                    # a bal is a call inside one hand-written unit: it vouches for no text extent
+                    sites[t] = sites.get(t, 0) + (0 if t in b.bals else 1)
+    good = [t for t in sorted(sites) if sites[t] and an.img.valid(t) and an.walk(t, an.img.end).ok]
+    if sum(sites[t] for t in good) >= 2:
+        return good, True
+    # One call is enough when its target opens a stack frame and walks strictly as a whole
+    # function: a stray jal read from data does not land on a prologue that walks.
+    return [t for t in good if an.is_prologue(t) and not an.walk(t, an.img.end).fell_through], False
 
 
 def _assemble(an: Analyser, info, image: Image, text_end: int) -> Catalogue:
@@ -726,14 +788,16 @@ def _assemble(an: Analyser, info, image: Image, text_end: int) -> Catalogue:
         if end < stop:
             findings.append(Finding(end, "stray_words", f"0x{stop - end:X} non-code bytes before 0x{stop:08X}", s))
         seed = ("entry" if s == info.entry else "call" if s in calls else "pointer" if s in pointers
-                else "tail" if an.starts[s] == "tail" else "unreferenced")
-        f = Function(s, end, b.end, name=f"func_{s:08X}", seed=seed)
+                else "tail" if an.starts[s] == "tail" else "branch" if an.starts[s] == "branch" else "unreferenced")
+        f = Function(s, end, _trim_alignment(image, s, b), name=f"func_{s:08X}", seed=seed)
         classify(image, f)
         if b.fell_through:
             f.flags.append("falls_through")
         if not b.ok:
             f.flags.append("invalid")
         funcs.append(f)
+    funcs = _reattach_epilogues(image, funcs, findings)
+    findings += _shared_units(image, funcs)
     for a, e in sorted(set(an.data_regions)):
         if e - a < 16 and e in an.starts:
             findings.append(Finding(a, "stray_words", f"0x{e - a:X} non-code bytes before 0x{e:08X}"))
@@ -753,6 +817,88 @@ def _assemble(an: Analyser, info, image: Image, text_end: int) -> Catalogue:
     return cat
 
 
+def _trim_alignment(image: Image, s: int, b: Body) -> int:
+    """End of ``b``'s code: a body that runs into the next start through zero words after a call
+    or a terminator (a routine that never returns, then alignment) ends after that delay slot."""
+    if not (b.ok and b.fell_through):
+        return b.end
+    q = b.end
+    while q - 4 > s and image.word(q - 4) == 0:
+        q -= 4
+    if q == b.end:
+        return b.end
+    last = image.ins(q - 4)
+    if not (last.doesLink() or _is_terminator(last)):
+        return b.end                            # the zeros are executed: they are code
+    return min(b.end, q + 4) if last.hasDelaySlot() else q
+
+
+def _epilogue_only(image: Image, s: int, e: int, frame: int) -> bool:
+    """[s, e) restores registers from the stack, pops a frame of ``frame`` bytes and returns."""
+    pops = returns = False
+    for pc in range(s, e, 4):
+        ins = image.ins(pc)
+        n = ins.getOpcodeName()
+        if ins.getRaw() == 0:
+            continue
+        if ins.isJrRa():
+            returns = True
+        elif n in ("addu", "or", "move", "daddu") and _written(ins) == mips.SP and mips.FP in _reads(ins):
+            continue
+        elif n in ("lw", "ld", "lwc1", "ldc1") and mips.reg(ins.rs) == mips.SP:
+            continue
+        elif n in ("addiu", "daddiu") and mips.reg(ins.rt) == mips.SP == mips.reg(ins.rs) and _simm(ins) == frame:
+            pops = True
+        else:
+            return False
+    return pops and returns
+
+
+def _reattach_epilogues(image: Image, funcs: list[Function], findings: list[Finding]) -> list[Function]:
+    """An unreferenced range that is nothing but the epilogue of the framed function right before
+    it (which ends in a jump back into itself: ``for (;;)`` at -O0) belongs to that function."""
+    out: list[Function] = []
+    for f in funcs:
+        p = out[-1] if out else None
+        if (p is not None and f.seed == "unreferenced" and p.frame and p.end == f.start
+                and p.body_end >= p.start + 8 and _epilogue_only(image, f.start, f.body_end, p.frame)):
+            jump = image.ins(p.body_end - 8)
+            back = _branch_target(jump)
+            if back is not None and not jump.doesLink() and p.start <= back < p.body_end and _is_terminator(jump):
+                findings.append(Finding(f.start, "epilogue_reattached",
+                                        f"unreachable epilogue of 0x{p.start:08X} (behind its endless loop)", p.start))
+                p.end, p.body_end = f.end, f.body_end
+                continue
+        out.append(f)
+    return out
+
+
+def _shared_units(image: Image, funcs: list[Function]) -> list[Finding]:
+    """A branch from one routine into the middle of another: the two are one unit (hand-written
+    code sharing a tail) or one of them is mis-split.  Recorded as a finding; the frameless target
+    is hand-written code (``branched_into``)."""
+    starts = [f.start for f in funcs]
+    out: list[Finding] = []
+    for f in funcs:
+        for pc in range(f.start, f.body_end, 4):
+            ins = image.ins(pc)
+            if not ins.isBranch() or ins.doesLink():
+                continue
+            t = _branch_target(ins)
+            if f.start <= t < f.body_end:
+                continue
+            i = bisect.bisect_right(starts, t) - 1
+            g = funcs[i] if i >= 0 and t < funcs[i].body_end else None
+            if g is None or g is f or t == g.start:
+                continue
+            out.append(Finding(pc, "shared_unit", f"0x{f.start:08X} branches to 0x{t:08X} inside 0x{g.start:08X}: "
+                                                  "one unit, or a mis-split", f.start))
+            if not g.frame and "branched_into" not in g.reasons:
+                g.reasons.append("branched_into")
+                g.kind = "asm"
+    return out
+
+
 def _dedupe(findings: list[Finding]) -> list[Finding]:
     seen, out = set(), []
     for f in findings:
@@ -763,16 +909,81 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return out
 
 
-def classify(image: Image, f: Function) -> None:
-    """Set ``kind`` to asm (hand-written), O0 (frame pointer), stub, leaf or c, and the frame size."""
-    names = []
-    handwritten = calls = False
+# Code no compiler emits, by named reason (``Function.reasons``).  Each is a fact about the
+# instructions, so a routine classified ``asm`` says why, and the reason travels to the reports.
+HANDWRITTEN_REASONS = {
+    "privileged": "a coprocessor-0, cache, TLB or eret instruction",
+    "not_compiler_output": "an encoding the compilers never emit",
+    "kernel_register": "uses $k0/$k1, which belong to the exception handler",
+    "callee_saved_clobbered": "writes a callee-saved register ($s0-$s7, $fp) without a stack frame",
+    "ra_in_register": "keeps the return address in another register",
+    "ra_relative": "reads data at an address computed from $ra",
+    "pc_read": "reads its own address with a linking branch (bal / bgezal $zero / bltzal)",
+    "branch_out": "a branch leaves the body (into a neighbour's code)",
+    "branched_into": "entered in its middle by a branch from another routine",
+    "tail_jump": "a frameless routine jumps (j) into another routine",
+    "call_without_saving_ra": "calls with no stack frame and without keeping $ra anywhere",
+    "frame_released_early": "pops its stack frame and goes on running (not at a return)",
+}
+_CALLEE_SAVED = {16, 17, 18, 19, 20, 21, 22, 23, 30}
+
+
+def handwritten_reasons(image: Image, f: Function) -> list[str]:
+    """The named reasons (``HANDWRITTEN_REASONS``) ``f``'s own instructions give for hand-written
+    code; empty for compiler output.  ``f.frame`` must already be known."""
+    found: list[str] = []
+
+    def note(reason):
+        if reason not in found:
+            found.append(reason)
+    saved_ra = False
     for pc in range(f.start, f.body_end, 4):
         ins = image.ins(pc)
+        if ins.getRaw() == 0:
+            continue
         n = ins.getOpcodeName()
+        if n in _COP0:
+            note("privileged")
+        elif ins.notEmittedByCompilers() or ins.isLikelyHandwritten():
+            note("not_compiler_output")
+        used = _reads(ins) | ({_written(ins)} if _written(ins) is not None else set())
+        if used & {26, 27}:
+            note("kernel_register")
+        if not f.frame and _written(ins) in _CALLEE_SAVED:
+            note("callee_saved_clobbered")
+        if ins.isBranch() and ins.doesLink():
+            note("pc_read")
+        elif ins.isBranch():
+            target = _branch_target(ins)
+            if not f.start <= target < f.body_end and not f.frame:
+                note("branch_out")
+        if ins.isJumpWithAddress() and not ins.doesLink() and not f.frame \
+                and not f.start <= ins.getInstrIndexAsVram() < f.body_end:
+            note("tail_jump")
+        if ins.doesLink() and not f.frame and not saved_ra:
+            note("call_without_saving_ra")
+        if (n in ("addiu", "daddiu") and mips.reg(ins.rt) == mips.SP == mips.reg(ins.rs) and _simm(ins) > 0
+                and pc + 4 < f.body_end and not image.ins(pc - 4).isJrRa()
+                and not any(image.ins(q).isJrRa() for q in range(pc + 4, min(pc + 16, f.body_end), 4))):
+            note("frame_released_early")
+        if mips.RA in _reads(ins) and not ins.isJrRa():
+            saved_ra = True
+        if mips.RA in _reads(ins) and not ins.isJrRa() and not ins.doesStore():
+            if ins.doesLoad() or (n in ("addiu", "daddiu") and _simm(ins)):
+                note("ra_relative")
+            elif _written(ins) not in (None, 0, mips.RA):
+                note("ra_in_register")
+    return found
+
+
+def classify(image: Image, f: Function) -> None:
+    """Set ``kind`` to asm (hand-written), O0 (frame pointer), stub, leaf or c, the frame size and,
+    for ``asm``, the reasons (``HANDWRITTEN_REASONS``)."""
+    names = []
+    calls = False
+    for pc in range(f.start, f.body_end, 4):
+        ins = image.ins(pc)
         names.append(ins)
-        if n in _COP0 or ins.notEmittedByCompilers() or ins.isLikelyHandwritten():
-            handwritten = True
         if ins.doesLink():
             calls = True
     head = names[:12]
@@ -782,7 +993,8 @@ def classify(image: Image, f: Function) -> None:
             break
     sets_fp = any(_written(i) == mips.FP and mips.SP in _reads(i) and i.getOpcodeName() in ("addu", "or", "daddu", "move", "addiu")
                   for i in head)
-    if handwritten:
+    f.reasons = handwritten_reasons(image, f)
+    if f.reasons:
         f.kind = "asm"
     elif sets_fp and f.frame:
         f.kind = "O0"
@@ -1034,8 +1246,13 @@ def to_toml(cat: Catalogue, title: str = "") -> str:
              "[[section]]", 'name = ".main"', f"rom = 0x{cat.rom:08X}", f"vram = 0x{cat.vram:08X}",
              f"size = 0x{cat.text_end - cat.vram:X}", "", "functions = ["]
     for f in cat.functions:
+        notes = [",".join(f.flags)] if f.flags else []
+        if f.end > f.body_end:
+            notes.append(f"pad:0x{f.end - f.body_end:X}")
+        if f.reasons:
+            notes.append("why:" + "+".join(f.reasons))
         lines.append(f'    {{ name = "{f.name}", vram = 0x{f.start:08x}, size = 0x{f.size:x} }},'
-                     f' # {f.kind}{(" " + ",".join(f.flags)) if f.flags else ""}')
+                     f' # {f.kind}{(" " + " ".join(notes)) if notes else ""}')
     lines.append("]")
     return "\n".join(lines) + "\n"
 

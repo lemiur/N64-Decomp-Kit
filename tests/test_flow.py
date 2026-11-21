@@ -90,5 +90,33 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(roles, ["load-delay", "delay-slot:return"])
 
 
+class DadduJumpTableTest(unittest.TestCase):
+    """EGCS -O2 -mips3 dispatches through ``daddu``: the table must be found as for ``addu``."""
+
+    def table_function(self, add_funct: int):
+        base = 0x80001000
+        # sll v0,a0,2 ; lui v1,%hi(T) ; (d)addu v0,v0,v1 ; lw v0,%lo(T)(v0) ; jr v0 ; nop ; 4 cases: jr ra ; nop
+        table = 0x80002000
+        hi, lo = (table + 0x8000) >> 16, table & 0xFFFF
+        words = [0x00041080, 0x3C030000 | hi, 0x00431000 | add_funct, 0x8C420000 | lo, 0x00400008, 0]
+        cases = [base + 4 * len(words) + 8 * k for k in range(4)]
+        words += [0x03E00008, 0] * 4
+        memory = {table + 4 * k: target for k, target in enumerate(cases)}
+        return code(words), base, memory.get, cases
+
+    def test_daddu_dispatch_is_recognised_like_addu(self):
+        found = {}
+        for funct in (0x21, 0x2D):
+            blob, base, read, cases = self.table_function(funct)
+            found[funct] = flow.find_jump_tables(blob, base, read)
+            self.assertEqual(found[funct], {base + 16: cases})
+        self.assertEqual(found[0x21], found[0x2D])
+
+    def test_daddu_of_two_runtime_registers_is_not_a_table(self):
+        # daddu v0,a0,a1 ; lw v0,0(v0) ; jr v0 : no lui, so no table
+        blob = code([0x0085102D, 0x8C420000, 0x00400008, 0])
+        self.assertEqual(flow.find_jump_tables(blob, 0x80001000, lambda a: 0x80001000), {})
+
+
 if __name__ == "__main__":
     unittest.main()

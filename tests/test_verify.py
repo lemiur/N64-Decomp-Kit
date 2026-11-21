@@ -226,3 +226,32 @@ class CorroboratedSectionTest(unittest.TestCase):
         self.assertTrue(transplant.fixed_address(0xA4400010))
         self.assertFalse(transplant.fixed_address(0x80000400))
         self.assertFalse(transplant.fixed_address(0x8009D030))
+
+
+class ConfirmSectionsTest(unittest.TestCase):
+    """One helper applies the content rule for resolved C, receipt issue and receipt replay."""
+
+    def test_a_confirmed_base_makes_the_comparison_exact_and_is_reported(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(TRUTH), {".data": DATA})
+        symbols = {"goodFunction": SYMBOLS["goodFunction"], "gRight": SYMBOLS["gRight"]}
+        verdict, confirmed = transplant.confirm_sections(lambda bases: strict(elf(TRUTH), rom, symbols, bases),
+                                                         elf(TRUTH), {})
+        self.assertEqual((verdict.verdict, confirmed), ("exact", {".data": DATA}))
+
+    def test_a_given_base_is_never_replaced_and_nothing_is_reported(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(TRUTH), {".data": DATA})
+        symbols = {"goodFunction": SYMBOLS["goodFunction"], "gRight": SYMBOLS["gRight"]}
+        verdict, confirmed = transplant.confirm_sections(lambda bases: strict(elf(TRUTH), rom, symbols, bases),
+                                                         elf(TRUTH), {".data": DATA})
+        self.assertEqual((verdict.verdict, confirmed), ("exact", {}))
+
+    def test_a_section_of_zeros_stays_an_assumption(self):
+        from n64dk.match import transplant
+        rom = rom_from(elf(SHORTDATA), {".data": DATA})
+        symbols = {"goodFunction": SYMBOLS["goodFunction"], "gRight": SYMBOLS["gRight"]}
+        verdict, confirmed = transplant.confirm_sections(lambda bases: strict(elf(SHORTDATA), rom, symbols, bases),
+                                                         elf(SHORTDATA), {})
+        self.assertEqual(confirmed, {})
+        self.assertNotEqual(verdict.verdict, "exact")

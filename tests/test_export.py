@@ -47,6 +47,19 @@ class RomCoverageTest(unittest.TestCase):
             self.assertIsNone(export.rom_coverage(Path(tmp) / "missing.tsv", 1))
 
 
+class WaitingDonorTest(unittest.TestCase):
+    def test_a_strict_proof_is_credited_over_a_donor_unit_that_still_waits(self):
+        case = lambda status: types.SimpleNamespace(status=status)
+        proved = export.proved_beside_waiting_donor
+        self.assertTrue(proved("donor-awaiting-symbols", case("exact"), True))
+        self.assertTrue(proved("donor-assembly-awaiting-symbols", case("assembly"), True))
+        self.assertFalse(proved("donor", case("exact"), True))                 # a verified unit keeps its functions
+        self.assertFalse(proved("donor-awaiting-symbols", case("assumed"), True))
+        self.assertFalse(proved("donor-awaiting-symbols", case("open"), True))
+        self.assertFalse(proved("donor-awaiting-symbols", case("exact"), False))
+        self.assertFalse(proved("donor-awaiting-symbols", None, False))
+
+
 class OriginTest(unittest.TestCase):
     def case(self, *stages):
         return types.SimpleNamespace(stages=list(stages))
@@ -144,7 +157,8 @@ class CodeRulesTest(unittest.TestCase):
             self.assertIn("Functions matched under the rules: 1.  MATCH-PENDING: 2 (R17 1, R2 1).", profile)
             self.assertIn("*Not established.*", profile)
             matched = (out / "MATCHED.tsv").read_text().splitlines()
-            self.assertTrue(matched[0].endswith("\treproduced_by\trules"))
+            # the rules column goes last, after the columns that say why a function is not settled
+            self.assertTrue(matched[0].endswith("\treproduced_by\tunit_class\treason_code\tnext_step\trules"))
             self.assertEqual(len(matched), 5)
 
     def test_a_relaxed_rule_is_named_in_the_profile(self):
@@ -158,3 +172,70 @@ class CodeRulesTest(unittest.TestCase):
             self.assertEqual((result["code_rules"]["pass"], result["code_rules"]["pass_awaiting_symbols"]), (1, 1))
             self.assertIn("- R2 relaxed: the surviving SDK source declares externs in each unit",
                           (out / "AGENTS.md").read_text())
+
+
+class DenominatorWarningTest(unittest.TestCase):
+    def test_incomplete_and_doubtful_catalogues_warn(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from n64dk.commands.export import _denominator_warning
+        run = Path(tempfile.mkdtemp(prefix="n64dk-test-warning-"))
+        self.assertIsNone(_denominator_warning(run))                                   # no report
+        for verdict, expected in (("complete", None), ("incomplete", "incomplete"), ("doubtful", "doubtful")):
+            (run / "report.json").write_text(json.dumps({"discovery": {"verdict": verdict}}))
+            found = _denominator_warning(run)
+            if expected is None:
+                self.assertIsNone(found)
+            else:
+                self.assertIn(expected, found)
+
+
+class UnitClassRowTest(unittest.TestCase):
+    def test_rows_carry_hexadecimal_sizes(self):
+        from n64dk.commands.export import _unit_class
+        evidence = {"entry": 0x80000400, "rsp": [(0x80001010, 0x80001100)], "kinds": {0x80002000: "asm"},
+                    "sdk": {0x80003000}}
+
+        def row(vram, size):                                 # as export() writes them
+            return ["main", "f", f"0x{vram:08X}", "0x1000", f"0x{size:X}", f"0x{size:X}", "open", "", "", ""]
+        self.assertEqual(_unit_class(row(0x80001000, 0x20), evidence), "rsp")     # reaches the range by its size
+        self.assertEqual(_unit_class(row(0x80001000, 0x10), evidence), "game")
+        self.assertEqual(_unit_class(row(0x80000400, 0x40), evidence), "boot")
+        self.assertEqual(_unit_class(row(0x80002000, 0x40), evidence), "handwritten")
+        self.assertEqual(_unit_class(row(0x80003000, 0x40), evidence), "sdk")
+
+
+class GpProvenanceTest(unittest.TestCase):
+    """A function built in a small-data lane against the run's recovered _gp says it needs that file."""
+
+    def test_the_how_column_marks_functions_that_need_the_recovered_gp(self):
+        from n64dk.commands.export import GP_DEPENDENT, _gp_note, _how
+
+        def case(recipe):
+            return types.SimpleNamespace(recipe=recipe, stages=[{"stage": "baseline"}])
+        self.assertEqual(_how(case("kmc+asg -O2 -G8"), True), f"kmc+asg -O2 -G8 (draft; {GP_DEPENDENT})")
+        self.assertEqual(_how(case("kmc+gas -O2 -G8"), True), f"kmc+gas -O2 -G8 (draft; {GP_DEPENDENT})")
+        self.assertEqual(_how(case("kmc+asg -O2 -G8"), False), "kmc+asg -O2 -G8 (draft)")   # the project's _gp
+        self.assertEqual(_how(case("kmc+as -O2"), True), "kmc+as -O2 (draft)")             # no small data
+        self.assertEqual(_gp_note(0), [])
+        self.assertIn("symbols/gp_symbols.txt", _gp_note(2)[0])
+
+    def test_the_gp_counts_as_recovered_only_when_the_project_declares_none(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        from n64dk.commands.export import _recovered_gp
+        root = Path(tempfile.mkdtemp(prefix="n64dk-test-gp-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        project, run = root / "project", root / "run"
+        project.mkdir()
+        run.mkdir()
+        (project / "n64dk.toml").write_text('[run]\nsymbols = ["syms.txt"]\n')
+        (project / "syms.txt").write_text("func_a = 0x80000400;\n")
+        self.assertFalse(_recovered_gp(project, run, "main"))              # the run declared no _gp
+        (run / "small_data").mkdir()
+        (run / "small_data" / "gp_symbols.txt").write_text("_gp = 0x80100000;\n")
+        self.assertTrue(_recovered_gp(project, run, "main"))
+        (project / "syms.txt").write_text("_gp = 0x80100000;\nfunc_a = 0x80000400;\n")
+        self.assertFalse(_recovered_gp(project, run, "main"))             # the project's own _gp was used

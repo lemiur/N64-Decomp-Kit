@@ -7,6 +7,12 @@ Pipelines
     kmc+asn64    KMC GCC -S -> ASN64-compatible converter -> modern GNU as --no-pad-sections
     kmc+atload   KMC GCC -S -> integer symbol loads expanded through $at -> KMC GNU as (an assembler
                  variant seen in retail code that no installed assembler reproduces)
+    kmc+atmacro  kmc+atload, and comparisons that only feed a branch rewritten as branch macros (which
+                 the assembler expands through $at), as some retail regions show
+    kmc+asg      KMC GCC -S -> KMC GNU as at the compiler's -G (small data: .comm/.lcomm symbols and
+                 float literals through $gp; the program's _gp must be declared)
+    kmc+gas      KMC GCC -S -> period GNU as 2.9.x at the compiler's -G (an assembler component: makes symbols the compiler
+                 declares small, ``.extern name, size``, GP-relative under -G; KMC as 2.6 does not)
     ido5.3       IDO 5.3 cc -c
     ido7.1       IDO 7.1 cc -c
     as           assembly source -> KMC GNU as
@@ -34,7 +40,8 @@ from pathlib import Path
 from . import asn64, custom_pipeline, normalize
 from .toolchain import Config
 
-PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "kmc+atload", "ido5.3", "ido7.1", "sn", "as")
+PIPELINES = ("kmc+hook", "kmc+builtin", "kmc+as", "kmc+asn64", "kmc+atload", "kmc+atmacro", "kmc+asg", "kmc+gas",
+             "ido5.3", "ido7.1", "sn", "as", "gnu-as")
 TOOLCHAIN_OF = {"ido5.3": "ido53", "ido7.1": "ido71", "sn": "sn"}
 _CACHE_LOCK = threading.RLock()
 _CACHE_STATS = {"hits": 0, "misses": 0, "stores": 0}
@@ -219,9 +226,33 @@ def _run(argv, cwd, env=None, stdin=None, retries: int = 0, timeout: float | Non
     return proc
 
 
-def _as_flags(flags: list[str]) -> list[str]:
-    # The assembler always runs at -G0: small-data placement is decided by the compiler's -G
-    # (assembler -G would turn absolute %hi/%lo accesses into $gp-relative ones).
+def small_data_threshold(flags: list[str]) -> int:
+    """The compiler's ``-G`` value (``-G8`` or ``-G 8``; 0 when absent)."""
+    for index, flag in enumerate(flags):
+        if flag == "-G" and index + 1 < len(flags):
+            text = flags[index + 1]
+        elif flag.startswith("-G") and len(flag) > 2:
+            text = flag[2:]
+        else:
+            continue
+        try:
+            return int(text, 0)
+        except ValueError:
+            continue
+    return 0
+
+
+SMALL_DATA_LANES = ("kmc+asg", "kmc+gas")
+
+
+def _as_flags(flags: list[str], pipeline: str = "") -> list[str]:
+    # The established lanes assemble at -G0 whatever the compiler's -G (assembler -G would turn
+    # absolute %hi/%lo accesses into $gp-relative ones).  The small-data lanes give the assembler the
+    # compiler's -G, as the GCC driver does: the compiler only declares small symbols
+    # (``.extern name, size``, ``.comm``); the assembler decides which accesses go through $gp, and
+    # the program's _gp must then be declared for the object to relocate (round 12).
+    if pipeline in SMALL_DATA_LANES:
+        return ["-mips3", f"-G{small_data_threshold(flags)}"]
     return ["-mips3", "-G0"]
 
 
@@ -323,6 +354,27 @@ def _file_digest(path: Path) -> bytes:
     return digest
 
 
+_CODE_DIGESTS: dict[tuple[str, ...], tuple[tuple, str]] = {}
+
+
+def pipeline_code_digest(paths: tuple[Path, ...] | None = None) -> str:
+    """SHA-256 of the build code's own sources (this module, the ASN64 converter, the normalizer),
+    part of every object's identity: the same value as hashing their concatenated bytes, which
+    ``build`` did on every build (about 167 KB read and hashed per build), recomputed only when a
+    file's size, mtime or inode changes (the rule ``_file_digest`` applies to tools)."""
+    files = tuple(Path(p) for p in (paths or (__file__, asn64.__file__, normalize.__file__)))
+    names = tuple(str(p) for p in files)
+    signature = tuple((s.st_size, s.st_mtime_ns, s.st_ino) for s in (p.stat() for p in files))
+    with _CACHE_LOCK:
+        known = _CODE_DIGESTS.get(names)
+    if known and known[0] == signature:
+        return known[1]
+    digest = hashlib.sha256(b"".join(p.read_bytes() for p in files)).hexdigest()
+    with _CACHE_LOCK:
+        _CODE_DIGESTS[names] = (signature, digest)
+    return digest
+
+
 def _compiler_digest(cfg: Config, pipeline: str) -> str:
     if custom_pipeline.is_custom(pipeline):
         # a configured lane is identified by its recipe text and the tools it names
@@ -340,6 +392,9 @@ def _compiler_digest(cfg: Config, pipeline: str) -> str:
     if pipeline == "kmc+asn64":
         gas = cfg.gnu_as()
         if gas and Path(gas[0]).is_file(): digest.update(_file_digest(Path(gas[0])))
+    if pipeline == "kmc+gas":
+        gas29 = cfg.gas29()
+        if gas29 is not None: digest.update(_file_digest(gas29))
     return digest.hexdigest()
 
 
@@ -470,9 +525,8 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
             forced.append(flag[len("-include"):])
     normalizer_digest = None
     if cfg.normalizer and Path(cfg.normalizer).is_file():
-        normalizer_digest = hashlib.sha256(Path(cfg.normalizer).read_bytes()).hexdigest()
-    pipeline_code = hashlib.sha256(Path(__file__).read_bytes() +
-        Path(asn64.__file__).read_bytes() + Path(normalize.__file__).read_bytes()).hexdigest()
+        normalizer_digest = _file_digest(Path(cfg.normalizer)).hex()     # = sha256(bytes).hexdigest()
+    pipeline_code = pipeline_code_digest()
     identity = json.dumps({"source": hashlib.sha256(source.read_bytes()).hexdigest(),
         "pipeline": pipe, "flags": spec.flags, "normalizer": spec.normalizer_args,
         "section_bases": spec.section_bases, "defines": defines or [],
@@ -545,7 +599,27 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
         elif pipe == "kmc+atload":                           # assembler variant: symbol loads through $at
             asm = Path(f"{stem}.s")
             asm.write_text(normalize.at_symbol_loads(raw.read_text(errors="replace")))
-        _run([kmc / "as", *_as_flags(spec.flags), "-o", obj, asm], unit_dir)
+        elif pipe == "kmc+atmacro":                          # and branch comparisons through $at
+            asm = Path(f"{stem}.s")
+            asm.write_text(normalize.at_macros(raw.read_text(errors="replace")))
+        if pipe == "kmc+gas":                               # assembler component: period GNU as 2.9.x
+            gas = cfg.gas29()
+            if gas is None:
+                raise BuildError("GNU as 2.9.x (kmc+gas) not found: set [toolchains] gas29")
+            _run([gas, *_as_flags(spec.flags, pipe), "-o", obj, asm], unit_dir)
+            return retain()
+        _run([kmc / "as", *_as_flags(spec.flags, pipe), "-o", obj, asm], unit_dir)
+        return retain()
+    if pipe == "gnu-as":
+        # the assembler the export proves generated and hand-written assembly with (handasm.RECIPE):
+        # modern GNU as at -march=vr4300.  KMC's period as encodes `move` as addu and pads FP
+        # hazards with nops, so an IDO title's listing would not reassemble to its own bytes.
+        from . import handasm
+        located = cfg.gnu_as()
+        if located is None:
+            raise BuildError("modern MIPS GNU as (gnu-as) not found: set [toolchains] binutils")
+        assembler, as_env = located
+        _run([assembler, *handasm.ASSEMBLER_FLAGS, *inc, "-o", obj, source], unit_dir, env=as_env)
         return retain()
     if pipe == "as":
         kmc = cfg.toolchain("kmc")
@@ -569,7 +643,38 @@ def build(source: Path, spec: BuildSpec, cfg: Config, workdir: Path,
             raise BuildError("SN GCC 2.8 toolchain not found")
         pre, asm, psyq = Path(f"{stem}.i"), Path(f"{stem}.s"), Path(f"{stem}.obj")
         _run(["gcc", "-E", "-P", "-undef", "-D__GNUC__=2", "-D__GNUC_MINOR__=8", *inc, source, "-o", pre], unit_dir)
-        _run([sn / "wibo", sn / "cc1n64.exe", "-quiet", *private_flags, pre, "-o", asm], unit_dir)
+        if os.environ.get("N64DK_SN_CXX") == "pm":
+            _run([sn.parent / "gcc2.8.1pm" / "cc1plus", "-quiet", *private_flags, pre, "-o", asm], unit_dir)
+            import re as _re
+            _path = (unit_dir / asm) if not Path(asm).is_absolute() else Path(asm)
+            _keep = []
+            _skip = False
+            for _line in _path.read_text().split("\n"):
+                _word = _line.strip().split()[0] if _line.strip() else ""
+                if _word == ".section":
+                    _skip = ".eh_frame" in _line or ".gcc_except" in _line   # unwind tables are not part of the image
+                    if _skip:
+                        continue
+                    if ".gnu.linkonce." in _line:        # one-per-program data and code: plain sections here
+                        _kind = _line.split(".gnu.linkonce.", 1)[1][:1]
+                        if _kind == "t":                 # compiler-made helpers shared by the whole program: not this unit's text
+                            _skip = True
+                            continue
+                        _line = "\t" + {"t": ".text", "r": ".rdata"}.get(_kind, ".data")
+                elif _word in (".text", ".data", ".rdata", ".sdata", ".bss"):
+                    _skip = False
+                if _skip or _word in (".version", ".type", ".size"):
+                    continue
+                if _word == ".string":
+                    _line = _line.replace(".string", ".ascii", 1).rstrip()[:-1] + '\\000"'
+                elif _word == ".weak":
+                    _line = _line.replace(".weak", ".globl", 1)
+                elif _word == ".comm" and _line.count(",") == 2:
+                    _line = _line.rsplit(",", 1)[0]
+                _keep.append(_line)
+            _path.write_bytes("\r\n".join(_keep).encode())             # SN's assembler reads its own compiler's dialect
+        else:
+            _run([sn / "wibo", sn / ("cc1pln64.exe" if os.environ.get("N64DK_SN_CXX") else "cc1n64.exe"), "-quiet", *private_flags, pre, "-o", asm], unit_dir)
         _run([sn / "wibo", sn / "asn64.exe", "-o", psyq, asm], unit_dir)
         _run([sn / "psyq-obj-parser", psyq, "-b", "-n", "-o", obj], unit_dir)
         return retain()

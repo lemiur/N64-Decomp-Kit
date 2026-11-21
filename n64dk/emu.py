@@ -238,9 +238,14 @@ class EmuResult:
 
 
 class Machine:
-    def __init__(self, rom: Rom, ram_size: int = RDRAM_SIZE, track_reads: bool = False):
-        self.rom = rom.data
+    def __init__(self, rom: Rom | None, ram_size: int = RDRAM_SIZE, track_reads: bool = False):
+        """``rom`` None: a bare machine (no boot image, no IPL3 state; the behaviour oracle loads
+        memory and registers itself)."""
+        self.rom = rom.data if rom is not None else b""
         self.track_reads = track_reads
+        # misaligned loads and stores stop ("address error", as the processor traps); set before the
+        # first instruction is translated.  Off for boot emulation; the behaviour oracle sets it.
+        self.strict_alignment = False
         self.reads = bytearray(ram_size >> LINE)   # 256-byte lines loaded from (track_reads only)
         self.snapshot: tuple | None = None
         self.ram = bytearray(ram_size)
@@ -268,6 +273,11 @@ class Machine:
         self.decoded: dict[int, object] = {}
         self.code_pages: dict[int, list[int]] = {}
         self._templates: dict[tuple[int, int], object] = {}
+        if rom is None:
+            self.boot_pages = set()
+            self.cop0[12] = 0x30000000           # Status: CU0 | CU1, FR clear (-mfp32 register pairs)
+            self.pc = 0
+            return
         entry = rom.header.entry
         phys = entry & 0x1FFFFFFF
         image = rom.data[0x1000:0x101000]
@@ -497,7 +507,7 @@ class Machine:
         key = (pc & M32, word)
         fn = self._templates.get(key)
         if fn is None:
-            src = _translate(pc & M32, word, self.track_reads)
+            src = _translate(pc & M32, word, self.track_reads, self.strict_alignment)
             ns = {"g": self.gpr, "m": self, "ram": self.ram, "RS": self.ram_size,
                   "dirty": self.dirty, "reads": self.reads, "code": self.code_pages, "calls": self.calls,
                   "X": sx32, "s32": _s32, "s64": _s64, "sext": _sext, "tdiv": _tdiv,
@@ -627,8 +637,9 @@ class Machine:
         return res
 
 
-def _translate(pc: int, word: int, track_reads: bool = False) -> str:
-    """Python source for one instruction, as ``def f():`` returning the control-flow result."""
+def _translate(pc: int, word: int, track_reads: bool = False, strict_alignment: bool = False) -> str:
+    """Python source for one instruction, as ``def f():`` returning the control-flow result.
+    ``strict_alignment``: a misaligned halfword/word/doubleword access stops (address error)."""
     op = word >> 26
     rs, rt, rd = (word >> 21) & 31, (word >> 16) & 31, (word >> 11) & 31
     sa, fn = (word >> 6) & 31, word & 63
@@ -777,6 +788,8 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
                 f"v = {fast} if a >> 30 == 2 and p < RS - {size - 1} else m.read(a, {size})", dst]
         if track_reads:
             body.append(f"if p < RS: reads[p >> {LINE}] = 1")
+        if strict_alignment and size > 1:
+            body[1:1] = [f"if a & {size - 1}:", " " + stop("address error")[0]]
     elif op in (34, 38):
         body = [f"a = ({A} + {simm}) & M32", f"v = m.lwlr({op}, a, {B})"] + setr(rt, "v")
     elif op in (40, 41, 43, 63, 57, 61, 56):
@@ -791,6 +804,8 @@ def _translate(pc: int, word: int, track_reads: bool = False) -> str:
                 "else:", f" m.write(a, {size}, v)"]
         if op == 56:
             body += setr(rt, "1")
+        if strict_alignment and size > 1:
+            body[1:1] = [f"if a & {size - 1}:", " " + stop("address error")[0]]
     elif op in (42, 46):
         body = [f"m.swlr({op}, ({A} + {simm}) & M32, {B})"]
     elif op in (26, 27, 44, 45):

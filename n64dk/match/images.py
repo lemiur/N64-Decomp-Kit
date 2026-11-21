@@ -279,3 +279,36 @@ def explain(project, image: str | None = None, vram: int | None = None, offset: 
             others.append(_in_image(other, link))
     result["other_images_mapping_this_vram"] = others
     return result
+
+
+RUN_CATALOGUES = "discovery/catalogues.json"
+
+
+def note_run_catalogue(run: Path, image: str, catalogue: Path) -> None:
+    """Record that a run resolved ``image`` against ``catalogue`` (repaired or corrected, inside the run
+    directory) instead of the project's."""
+    import json
+    import os
+    path = Path(run) / RUN_CATALOGUES
+    held = json.loads(path.read_text()) if path.is_file() else {}
+    held[image] = os.path.relpath(Path(catalogue).resolve(), Path(run).resolve())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(held, indent=1, sort_keys=True) + "\n")
+
+
+def with_run_catalogue(spec: "ImageSpec", run: Path) -> "ImageSpec":
+    """``spec`` with the catalogue a run recorded for it (``note_run_catalogue``); ``spec`` itself when the
+    run used the project's catalogue or the recorded file is gone or lies outside the run directory."""
+    import dataclasses
+    import json
+    path = Path(run) / RUN_CATALOGUES
+    try:
+        relative = json.loads(path.read_text()).get(spec.name)
+    except (OSError, ValueError):
+        return spec
+    if not relative:
+        return spec
+    found = (Path(run) / relative).resolve()
+    if not found.is_file() or Path(run).resolve() not in found.parents:
+        return spec
+    return dataclasses.replace(spec, catalogue=found, _rows=None)

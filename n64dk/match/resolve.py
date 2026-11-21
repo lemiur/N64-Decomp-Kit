@@ -40,6 +40,7 @@ from . import handasm
 from . import iterate as itermod
 
 BLOCKING = ("boundary.fragment", "boundary.false_split", "boundary.embedded_data")
+REWRITES_OF_BEST = 10          # rewrites of the best source tried after the search (one build each)
 # The variant search is skipped when the best draft is further than this from the target.
 # Measured over 1,712 searches on two titles (IDO and KMC GCC): none of the 630 that started above
 # 40 reached an exact match, the furthest success started at 29, and those 630 took 37% of all
@@ -191,7 +192,10 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
             recipe_label: str = "", rom_offset: int | None = None,
             search_ceiling: int | None = SEARCH_CEILING, frame_fit: bool = True,
             cross_recipes: int | None = None, fresh: bool = False, governor=None, stratum: str = "",
-            provisional: bool = False, wide_recipes=None) -> Case:
+            provisional: bool = False, wide_recipes=None, search: bool = True,
+            drafts_x_recipes: bool = True, rewrites=None, near_siblings: bool = True, loop_forms: bool = True,
+            hand_forms: bool = True, hand_forms_budget: int = 40,
+            region_levels: tuple[str, ...] = ()) -> Case:
     """Run the ladder for one function and store the case.
 
     ``evaluate(text) -> (iterate.Evaluation, relocated candidate bytes or None)``;
@@ -209,7 +213,19 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     detected family, the retry is skipped (round 11: it paid only on unoptimised code).
     ``provisional`` marks the case as a sample (recipe calibration):
     the next ordinary resolve of an unsettled provisional case starts fresh in the same way, so a
-    function's outcome does not depend on whether calibration happened to sample it."""
+    function's outcome does not depend on whether calibration happened to sample it.  ``search``,
+    ``frame_fit`` and ``drafts_x_recipes`` false switch one rung off (decompile-run ablation switches);
+    no switch reaches the strict verdict, so a rung switched off can only cost a match.
+    ``rewrites`` (optional, ``text -> [(label, text)]``) gives the recipe's rewrites of a source
+    (``n64dk.match.redraft``); they are tried once more on the best source the search ends with, because
+    a rewrite keyed on how a loop or a temporary is written may apply only to what the search made of the
+    draft (measured on a title: rewrites that matched four functions from such sources found none of them
+    from the first drafts).  ``near_siblings`` (default on) tries a near miss under the sibling
+    versions of its compiler (``compilers.sibling_recipe``; ``region_levels``: the optimisation
+    levels the region already uses) and, for IDO, its local-free forms, before the variant search.
+    A provisional (calibration) case that ends exact is rebuilt under the sibling versions at the
+    same flags (stage ``version-check``), so a function exact under both versions is not counted
+    as evidence for either."""
     size, digest = len(target), hashlib.sha256(target).hexdigest()
     key = case_id(image, vram, size)
 
@@ -305,6 +321,22 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                 status, next_step = "assumed", "declare the assumed symbols/sections, then verify again"
             elif verdict != "exact":
                 status, next_step = "open", "strict verification did not produce an exact verdict"
+        if provisional and status in ("exact", "assumed") and recipes is not None and case.best_digest:
+            from . import compilers as compmod
+            current = case.recipe or recipe_label
+            under = []
+            try:
+                best_source = store.source(case.best_digest) or ""
+                pipe_now, _, flags_now = (current or "").partition(" ")
+                for label, _rp, rev in recipes(None):
+                    if label.partition(" ")[0] in compmod.siblings(pipe_now) and label.partition(" ")[2] == flags_now:
+                        evaluation, _code = rev(best_source)
+                        case.builds += 1
+                        if evaluation.exact or evaluation.score == 0:
+                            under.append(label)
+            except Exception:
+                under = None
+            case.stages.append({"stage": "version-check", "recipe": current, "exact_under": under})
         if status == "exact" and (case.strict or {}).get("verdict") != "exact":
             # No exploration oracle, historical label, or interrupted verifier may grant exact
             # credit.  Exact is a proof state, not a score or a caller assertion.
@@ -398,7 +430,7 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     # 2b. drafts x recipes.  The portfolio was ranked under one recipe; a draft that is a near
     #     miss there is often exact under a sibling (another version of the same compiler, the
     #     flags of a neighbouring unit), and it need not be the draft that ranked first.
-    if recipes is not None and base is not None and not base.exact and scored:
+    if drafts_x_recipes and recipes is not None and base is not None and not base.exact and scored:
         candidates = [row for row in scored if row[0] != 1 << 30][:CROSS_DRAFTS]
         tried, chosen = 0, None
         for label, recipe_pipeline, recipe_evaluate in list(recipes(family))[:cross_recipes or CROSS_RECIPES]:
@@ -517,6 +549,61 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                             "source_digest": store.save_source(text)})
         return finish("does-not-build", causemod.diagnose(target, None, vram, flow, neighbours),
                       "fix the compile error: " + (base.error or "")[-200:])
+    # 3b. near miss: sibling versions before source permutation.  A source that is a few
+    #     instructions off at the right size is often right for another version of the same
+    #     compiler (Sesame Street: the speech library was IDO 7.1 in a title configured IDO 5.3).
+    #     For IDO the local-free form of the source (cached field copies read in place) is tried
+    #     under the current and the sibling recipes too: it was what IDO 7.1 needed.
+    state = {"base": base, "text": text, "evaluate": evaluate, "pipeline": pipeline}
+
+    def near_sibling_stage(stage: str = "near-siblings", extra=()) -> None:
+        """Sibling versions (and, for IDO, the local-free forms) of a near miss; updates ``state``."""
+        base, text, evaluate, pipeline = state["base"], state["text"], state["evaluate"], state["pipeline"]
+        if not (near_siblings and not base.exact and base.score is not None and base.score <= near):
+            return
+        from . import compilers as compmod
+        from . import draftforms
+        code_now = built.get(hashlib.sha256(text.encode()).hexdigest())
+        # the same size up to a few instructions (alignment padding; nops an assembler fills or drops)
+        same_size = code_now is None or abs(len(code_now.rstrip(b"\0")) - len(target.rstrip(b"\0"))) <= 16
+        current = case.recipe or recipe_label
+        forms = [("source", text)] + [(label, form) for label, form in extra if form != text]
+        if causemod.pipeline_family(pipeline) == "ido" or (current or "").startswith("ido"):
+            forms += [(label, form) for label, form, _review in draftforms.local_free_drafts(text, name)]
+        lanes = [("current", pipeline, evaluate)]
+        if same_size and recipes is not None and current:
+            try:
+                lanes += [(label, rp, rev) for label, rp, rev in recipes(family)
+                          if compmod.sibling_recipe(current, label, region_levels)]
+            except Exception:
+                pass
+        tried, chosen = 0, None
+        for lane_label, lane_pipeline, lane_evaluate in lanes:
+            for form_label, form in forms:
+                if lane_label == "current" and (form_label == "source" or (form_label, form) in extra):
+                    continue                                   # already built under this recipe
+                evaluation, code = lane_evaluate(form)
+                tried += 1
+                case.builds += 1
+                if evaluation.score is not None and (evaluation.score < base.score or
+                                                     (evaluation.exact and not base.exact)):
+                    base, text, chosen = evaluation, form, (lane_label, form_label)
+                    built[hashlib.sha256(form.encode()).hexdigest()] = code
+                    if lane_label != "current":
+                        evaluate, pipeline, case.recipe = lane_evaluate, lane_pipeline, lane_label
+                if base.exact:
+                    break
+            if base.exact:
+                break
+        if tried:
+            case.stages.append({"stage": stage, "tried": tried, "lanes": [l for l, _p, _e in lanes],
+                                "forms": [f for f, _t in forms], "chosen": list(chosen) if chosen else None,
+                                "score": base.score})
+            event(stage, tried=tried, chosen=chosen, score=base.score)
+        state.update(base=base, text=text, evaluate=evaluate, pipeline=pipeline)
+
+    near_sibling_stage()
+    base, text, evaluate, pipeline = state["base"], state["text"], state["evaluate"], state["pipeline"]
     case.best_score, case.best_digest = base.score, store.save_source(text)
     case.stages.append({"stage": "baseline", "score": base.score, "exact": base.exact})
     if base.outcome and base.outcome.get("proof"):
@@ -535,6 +622,101 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
         else found
     case.stages.append({"stage": "diagnose", "causes": [c.id for c in ranked][:6]})
 
+    # 4b. loop form.  When the only difference is a consistent exchange of registers, GCC 2.7.2 ranked
+    #     two values the other way round, and references inside a loop count once per loop level: a
+    #     loop written with a backward goto is no loop to it, while (1) is (strcpy of the KMC C library,
+    #     Sesame Street).  The goto <-> structured rewrites are tried, both directions, before the search.
+    # A register-only difference counts too when the exchange is consistent only within each value's
+    # lifetime (``register.pressure`` without structural differences, confidence 0.6): the strcpy case.
+    registers_only = bool(ranked) and (ranked[0].id == "register.permutation" or
+                                       (ranked[0].id == "register.pressure" and ranked[0].confidence >= 0.6))
+    if loop_forms and registers_only and not base.exact:
+        from . import loopforms
+        tried, chosen, scores = 0, None, []
+        for label, form in loopforms.variants(text, name):
+            evaluation = run(form)
+            tried += 1
+            case.builds += 1
+            scores.append((evaluation.score, label, form))
+            if evaluation.score is not None and (evaluation.score < base.score or (evaluation.exact and not base.exact)):
+                base, text, chosen = evaluation, form, label
+                if evaluation.exact:
+                    break
+        if tried:
+            case.stages.append({"stage": "loop-form", "tried": tried, "chosen": chosen, "score": base.score})
+            event("loop-form", tried=tried, chosen=chosen, score=base.score)
+        if chosen:
+            case.best_score, case.best_digest = base.score, store.save_source(text)
+            if base.outcome and base.outcome.get("proof"):
+                case.proof = base.outcome["proof"]
+            state.update(base=base, text=text, evaluate=evaluate, pipeline=pipeline)
+            if not base.exact:                  # the new form may be right for a sibling version
+                # every loop form as close as the chosen one is tried under the siblings
+                near_sibling_stage("near-siblings-after-loop-form",
+                                   [(label, form) for score, label, form in scores if score == base.score])
+                base, text, evaluate, pipeline = state["base"], state["text"], state["evaluate"], state["pipeline"]
+                case.best_score, case.best_digest = base.score, store.save_source(text)
+                if base.outcome and base.outcome.get("proof"):
+                    case.proof = base.outcome["proof"]
+            if base.exact:
+                return finish("exact", [], "strictly verified; prepare independent integration")
+
+    # 4c. hand forms (n64dk.match.handforms): the rewrites that matched functions by hand in the
+    #     Madden Football 64 campaign, chosen by the diagnosis (globals as one aggregate or volatile
+    #     for schedule/reload causes, chained or split assignments, tails per branch or merged,
+    #     locals narrowed to the target's own extension widths, top-tested loops for frame sizes).
+    #     Here only a form that is exact by itself is taken: a form that is merely closer would move
+    #     the search's start away from the path it finds from the draft (measured: a split variable
+    #     the search found from the draft was no longer reached), and the pass is kept to an eighth
+    #     of the budget.  Inside the search the same forms are the ``hand`` family, which combines
+    #     with the other edits; what the search leaves of the budget goes to the forms of its best
+    #     source (stage 5c).
+    from . import handforms
+    assisted = handforms.fixmul_sites(target)
+    if assisted:
+        case.stages.append({"stage": "assisted-class", "kind": "fixmul", "sites": assisted[:8],
+                            "note": "fixed-point multiply macro (inline asm in the project): assisted, not plain C"})
+    hand_causes = [c.id for c in ranked]
+    hand_reserve = 0
+
+    def hand_stage(stage: str, start_text: str, start: itermod.Evaluation, allowance: int, greedy: bool):
+        """Hand forms of ``start_text``; returns (text, evaluation, chosen, tried)."""
+        tried, chosen, best_text, best_eval = 0, [], start_text, start
+        for _round in range(2 if greedy else 1):
+            improved = False
+            for label, form in handforms.forms_for(hand_causes, best_text, name, target):
+                if tried >= allowance:
+                    break
+                evaluation = run(form)
+                tried += 1
+                case.builds += 1
+                better = evaluation.exact or (greedy and evaluation.score is not None and
+                                              best_eval.score is not None and evaluation.score < best_eval.score)
+                if better:
+                    best_text, best_eval, improved = form, evaluation, True
+                    chosen.append(label)
+                    if evaluation.exact:
+                        break
+            if best_eval.exact or not improved:
+                break
+        if tried:
+            case.stages.append({"stage": stage, "tried": tried, "chosen": chosen, "score": best_eval.score,
+                                "kinds": handforms.kinds_for(hand_causes)})
+            event(stage, tried=tried, chosen=chosen, score=best_eval.score)
+        return best_text, best_eval, chosen
+
+    if hand_forms and not base.exact and base.score is not None and base.score <= 4 * near and hand_causes:
+        hand_reserve = 1                                   # marks the stage as on; nothing is held back
+        new_text, new_eval, chosen = hand_stage("hand-forms", text, base,
+                                                min(hand_forms_budget, max(2, budget // 8),
+                                                    max(0, budget - case.builds)), False)
+        if chosen and new_eval.exact:
+            base, text = new_eval, new_text
+            case.best_score, case.best_digest = base.score, store.save_source(text)
+            if base.outcome and base.outcome.get("proof"):
+                case.proof = base.outcome["proof"]
+            return finish("exact", [], "strictly verified; prepare independent integration")
+
     # 5. iterate: one search over every family, the ones the causes justify first, so that edits
     #    from different families can combine; families closed for this exact source on an earlier
     #    run are not repeated
@@ -546,6 +728,10 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
     if search_ceiling and best.score is not None and best.score > search_ceiling:
         case.stages.append({"stage": "iterate-skipped", "score": best.score, "ceiling": search_ceiling})
         event("iterate-skipped", score=best.score, ceiling=search_ceiling)
+        families = []
+    if not search and families:
+        case.stages.append({"stage": "iterate-skipped", "reason": "variant search switched off (ablation)"})
+        event("iterate-skipped", reason="switched off")
         families = []
     stratum = (governor.stratum(stratum or recipe_label or pipeline or "", best.score)
                if governor is not None else None)
@@ -592,6 +778,60 @@ def resolve(store: CaseStore, image: str, name: str, vram: int, target: bytes, e
                                   "candidate is exploration-exact but lacks strict relocation/data proof")
                 event("exact-found", builds=case.builds)
                 return finish("exact", [], "strictly verified; prepare independent integration")
+
+    # 5b. the recipe's rewrites of the best source
+    if rewrites is not None and not best.exact and best.score is not None and best.score > 0:
+        try:
+            offered = list(rewrites(best_text))[:REWRITES_OF_BEST]
+        except Exception:                                    # a rewrite is optional; the best source stands
+            offered = []
+        tried, start = 0, best.score
+        for label, variant in offered:
+            evaluation = run(variant)
+            case.builds += 1
+            tried += 1
+            if evaluation.score is None or evaluation.score >= best.score:
+                continue
+            best_text, best = variant, evaluation
+            case.best_score, case.best_digest = best.score, store.save_source(best_text)
+            if best.exact:
+                break
+        if tried:
+            case.stages.append({"stage": "rewrite-best", "tried": tried, "start": start, "final": best.score})
+            event("rewrite-best", tried=tried, start=start, final=best.score)
+        if best.exact:
+            verified, _code = evaluate(best_text)
+            case.proof = (verified.outcome or {}).get("proof")
+            case.stages.append({"stage": "strict-verify", "verdict": (case.proof or {}).get("verdict", "missing")})
+            if not verified.exact:
+                return finish("assumed", ranked,
+                              "candidate is exploration-exact but lacks strict relocation/data proof")
+            event("exact-found", builds=case.builds)
+            return finish("exact", [], "strictly verified; prepare independent integration")
+
+    # 5c. hand forms of the search's best source (greedy, from the allowance kept for them)
+    if hand_reserve and not best.exact and best.score is not None and best.score > 0:
+        new_text, new_eval, chosen = hand_stage("hand-forms-best", best_text, best,
+                                                min(hand_forms_budget, max(0, budget - case.builds)), True)
+        if chosen:
+            best_text, best = new_text, new_eval
+            case.best_score, case.best_digest = best.score, store.save_source(best_text)
+            if not best.exact:
+                state.update(base=best, text=best_text)
+                near_sibling_stage("near-siblings-after-hand-forms")
+                evaluate, pipeline = state["evaluate"], state["pipeline"]
+                if state["base"].score is not None and state["base"].score < best.score:
+                    best, best_text = state["base"], state["text"]
+                    case.best_score, case.best_digest = best.score, store.save_source(best_text)
+        if best.exact:
+            verified, _code = evaluate(best_text)
+            case.proof = (verified.outcome or {}).get("proof")
+            case.stages.append({"stage": "strict-verify", "verdict": (case.proof or {}).get("verdict", "missing")})
+            if not verified.exact:
+                return finish("assumed", ranked,
+                              "candidate is exploration-exact but lacks strict relocation/data proof")
+            event("exact-found", builds=case.builds)
+            return finish("exact", [], "strictly verified; prepare independent integration")
 
     # 6. classify what is left
     final_code = built.get(hashlib.sha256(best_text.encode()).hexdigest())
@@ -645,6 +885,7 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
     after which a rerun verifies those cases strictly).  Nothing is written anywhere but ``out``."""
     out = Path(out)
     rows, skipped, assumptions, assembly = [], [], [], []
+    placed: list[tuple[str, int, str, str]] = []
     declarations: dict[tuple[str, str], list[str]] = {}
     for case in store.all():
         if image and case.image != image:
@@ -676,6 +917,13 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{case.name}.c").write_text(text)
         pipeline, _, flags = case.recipe.partition(" ")
+        if verdict == "exact":
+            # A section the strict comparison placed by its own contents (a switch's jump table, constants:
+            # ``corroborated``).  A link needs that address, or the unit's code differs from the ROM; the recipe
+            # itself stays as verified (a receipt rebuilds under it and confirms the section again), so the
+            # placements are listed beside the queue.
+            for section, address in sorted(((case.strict or case.proof or {}).get("corroborated") or {}).items()):
+                placed.append((case.image, case.vram, section, address))
         rows.append((case.image, pipeline, case.rom_offset, case.vram, case.size, f"{case.image}/{case.name}.c",
                      flags, verdict))
         for item in (case.strict or case.proof or {}).get("assumptions", []):
@@ -710,6 +958,10 @@ def export_queue(store: CaseStore, out: Path, image: str | None = None, include_
         (out / "assembly.tsv").write_text("\n".join(lines) + "\n")
     if rows:
         out.mkdir(parents=True, exist_ok=True)
+        (out / "placed_sections.tsv").write_text(
+            "# image\tvram\tsection\taddress\torigin  (sections of exact units placed by their own contents)\n"
+            + "".join(f"{image_name}\t0x{vram:08X}\t{section}\t{address}\tsection-content\n"
+                      for image_name, vram, section, address in sorted(placed)))
         (out / "queue.tsv").write_text("\n".join(table("exact")) + "\n")
         (out / "assumed.tsv").write_text("\n".join(table("assumed")) + "\n")
         (out / "assumptions.tsv").write_text("# image\tunit\tkind\tname\taddress\n" + "\n".join(assumptions) + "\n")

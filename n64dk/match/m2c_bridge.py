@@ -158,10 +158,12 @@ def layout(code: bytes, vram: int, jump_tables=None) -> Layout:
 
 def emit_asm(name: str, code: bytes, vram: int, names: dict[int, str] | None = None,
              jump_tables: list[tuple[int, list[int]]] | None = None, macros: bool = True,
-             external: str = "symbol") -> str:
+             external: str = "symbol", gp: int | None = None) -> str:
     """Symbolized assembly for one function.  ``names`` maps addresses to symbol names;
     ``jump_tables`` is ``[(table_address, [targets...])]`` (see ``find_jump_tables``).
-    ``external`` is ``"symbol"`` or ``"stub"`` (see the module docstring)."""
+    ``external`` is ``"symbol"`` or ``"stub"`` (see the module docstring).  ``gp`` is the
+    program's ``_gp`` when known: GP-relative accesses become ``%gp_rel(sym)($gp)`` so the
+    decompiler names the small global (a ``-G`` title)."""
     if external not in ("symbol", "stub"):
         raise ValueError(f"external must be 'symbol' or 'stub', not {external!r}")
     symbols = dict(names or {})
@@ -204,6 +206,11 @@ def emit_asm(name: str, code: bytes, vram: int, names: dict[int, str] | None = N
         elif site in pairs:
             symbol = _name(pairs[site], symbols, "D")
             override = f"%hi({symbol})" if word >> 26 == 15 else f"%lo({symbol})"
+        elif gp is not None and (word >> 21) & 31 == 28 and (word >> 16) & 31 != 28 \
+                and (word >> 26 == 9 or ins.doesLoad() or ins.doesStore()):
+            field = word & 0xFFFF
+            address = (gp + (field - 0x10000 if field & 0x8000 else field)) & 0xFFFFFFFF
+            override = f"%gp_rel({_name(address, symbols, 'D')})"
         if not ins.isValid():
             lines.append(f"    /* {site:08X} {word:08X} */ .word 0x{word:08X}")
             continue
@@ -235,25 +242,54 @@ class _TableProbe(fa.Analyser):
         self.const_jumps: dict[int, int] = {}
 
 
-def find_jump_tables(data: bytes, image_vram: int, start: int, size: int) -> list[tuple[int, list[int]]]:
+class _Layered(fa.Image):
+    """The function's own image, with other images of the project behind it for the addresses it does
+    not hold: an overlay's jump tables may stand in the resident image (measured on a title: 44
+    functions of four overlays, every table at a low resident address)."""
+
+    def __init__(self, data: bytes, vram: int, behind):
+        super().__init__(data, vram)
+        self._behind = [fa.Image(other, other_vram) for other, other_vram in behind]
+
+    def _layer(self, v: int):
+        if self.vram <= v < self.end:
+            return None
+        return next((layer for layer in self._behind if v in layer), None)
+
+    def __contains__(self, v: int) -> bool:
+        return self.vram <= v < self.end or self._layer(v) is not None
+
+    def word(self, v: int) -> int:
+        layer = self._layer(v)
+        return super().word(v) if layer is None else layer.word(v)
+
+
+def find_jump_tables(data: bytes, image_vram: int, start: int, size: int,
+                     also=()) -> list[tuple[int, list[int]]]:
     """Jump tables dispatched by ``jr reg`` inside ``[start, start+size)`` of a linear image
     whose first byte is at ``image_vram``, as recognised by function discovery.  A table bounded
     by ``sltiu`` keeps every entry (targets outside the body become external edges); an
-    unbounded one is read only while entries stay inside the body."""
-    image = fa.Image(data, image_vram)
+    unbounded one is read only while entries stay inside the body.  ``also`` lists other images
+    ``(data, vram)`` a table may be read from when its address lies outside this one; each is tried by
+    itself, in order, for the dispatches still without a table, so an image that merely covers the
+    address with something else decides nothing."""
     end = start + size
-    if size <= 0 or start % 4 or start not in image or end > image.end:
-        return []
-    wide, narrow = _TableProbe(image, image.end), _TableProbe(image, end)
     found: dict[int, list[int]] = {}
-    for pc in range(start, end - 4, 4):
-        if not image.ins(pc).isJrNotRa():
-            continue
-        table = wide.jump_table(start, pc)
-        if table is None or not table.bounded:
-            table = narrow.jump_table(start, pc)
-        if table is not None:
-            found.setdefault(table.address, table.targets)
+    settled: set[int] = set()
+    for behind in [()] + [(other,) for other in also]:
+        image = _Layered(data, image_vram, behind) if behind else fa.Image(data, image_vram)
+        if size <= 0 or start % 4 or not image_vram <= start < image.end or end > image.end:
+            return []
+        wide, narrow = _TableProbe(image, image.end), _TableProbe(image, end)
+        for pc in range(start, end - 4, 4):
+            if pc in settled or not image.ins(pc).isJrNotRa():
+                continue
+            table = wide.jump_table(start, pc)
+            if table is None or not table.bounded:
+                table = narrow.jump_table(start, pc)
+            if table is not None:
+                found.setdefault(table.address, table.targets)
+                settled.add(pc)
     return sorted(found.items())
 
 
@@ -369,7 +405,7 @@ def _failure_text(stdout: str, stderr: str, returncode: int) -> str:
 
 def draft(name: str, code: bytes, vram: int, compiler: str = "kmc", context: Path | None = None,
           names: dict[int, str] | None = None, jump_tables=None, extra: list[str] | None = None,
-          timeout: float = 60, m2c: str | None = None, environ: dict | None = None) -> dict:
+          timeout: float = 60, m2c: str | None = None, environ: dict | None = None, gp: int | None = None) -> dict:
     """Run m2c on one function and report what happened.
 
     Always returns ``asm`` (faithful listing) and ``m2c_input`` (stub listing), plus
@@ -401,8 +437,8 @@ def draft(name: str, code: bytes, vram: int, compiler: str = "kmc", context: Pat
         return fail(INVALID_INPUT, f"{name!r} is not a valid assembler symbol")
     if len(code) < 4:
         return fail(INVALID_INPUT, "no instructions (code is shorter than 4 bytes)")
-    result["asm"] = emit_asm(name, code, vram, names, jump_tables)
-    result["m2c_input"] = emit_asm(name, code, vram, names, jump_tables, macros=False, external="stub")
+    result["asm"] = emit_asm(name, code, vram, names, jump_tables, gp=gp)
+    result["m2c_input"] = emit_asm(name, code, vram, names, jump_tables, macros=False, external="stub", gp=gp)
     if context is not None and not Path(context).is_file():
         return fail(INVALID_INPUT, f"context file not found: {context}")
     found = locate_m2c(m2c, environ)

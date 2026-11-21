@@ -9,8 +9,8 @@ Inputs are described by a recipe (TOML):
 
     [ultralib]                  # an ultralib source tree
     path = "/path/ultralib"
-    versions = ["I", "J", "K", "L"]
-    targets = ["libultra_rom", "libgultra_rom"]
+    versions = ["D", "E", "F", "G", "H", "I", "J", "K", "L"]
+    targets = ["libultra_rom", "libgultra_rom", "libultra", "libgultra"]   # the plain builds link rmon
 
     [[sources]]                 # a project manifest of matched library units
     tag = "project"
@@ -241,8 +241,10 @@ def build(recipe: dict, scratch: Path, jobs_n: int | None = None, log=print) -> 
     ul = recipe.get("ultralib")
     if ul:
         path = Path(ul["path"])
-        for version in ul.get("versions", list("IJKL")):
-            for target in ul.get("targets", ["libultra_rom", "libgultra_rom"]):
+        for version in ul.get("versions", list("DEFGHIJKL")):
+            # the plain builds (no _FINALROM) keep rmon and the debug-port exception code that
+            # titles such as Sesame Street (KMC, 2.0F) link
+            for target in ul.get("targets", ["libultra_rom", "libgultra_rom", "libultra", "libgultra"]):
                 jobs.extend(_ultralib_jobs(path, version, target, tc, scratch))
     for spec in recipe.get("sources", []):
         jobs.extend(_source_jobs(spec, tc, scratch))

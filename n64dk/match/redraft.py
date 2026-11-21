@@ -24,7 +24,7 @@ GENERATORS: dict[str, str] = {
     "redraft_ido_opt": "IDO -O1/-O2 near misses: source forms IDO distinguishes that a decompiler does not",
     "redraft_elements": "pointer sums written in bytes, said in elements (a byte cast changes IDO's registers)",
 }
-MAX_VARIANTS = 6                # per generator and draft: each one costs a build for every unmatched function
+MAX_VARIANTS = 10               # per generator and draft: each one costs a build for every unmatched function
 
 
 def _load(module: str):

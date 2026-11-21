@@ -334,13 +334,30 @@ def table_ranges(data: bytes, vram: int, rom_size: int, stream_starts: set[int] 
             j += 1
         block = [forms[k][0] for k in range(i, j)]
         form = forms[i][1]
-        for half in range(len(block) // 2, 1, -1):
-            for lead in range(0, len(block) - 2 * half + 1):
+        # Same search, same order, same answer as trying every (half, lead) in full; the per-position
+        # tests decide in linear time per half which leads can pass the span test, so the expensive
+        # sorted disjointness check runs only on those (round 12: a 64 MB ROM spent ~1,450 s here).
+        streams = [0]
+        for value in block:
+            streams.append(streams[-1] + (value in stream_starts))
+        # a raw-form candidate needs two stream starts among its starts: a block with fewer has none
+        halves = range(len(block) // 2, 1, -1) if form == "pi" or streams[-1] >= 2 else ()
+        for half in halves:
+            limit = len(block) - 2 * half + 1
+            if limit <= 0:
+                continue
+            bad = [0]                                          # prefix count of failing positions
+            for k in range(len(block) - half):
+                d = block[k + half] - block[k]
+                bad.append(bad[-1] + (not 0 < d <= MAX_RANGE))
+            for lead in range(0, limit):
+                if bad[lead + half] - bad[lead]:
+                    continue                                   # some span is empty, reversed or too long
+                if form != "pi" and streams[lead + half] - streams[lead] < 2:
+                    continue
                 st, en = block[lead:lead + half], block[lead + half:lead + 2 * half]
                 spans = sorted(zip(st, en))
-                if all(0 < y - x <= MAX_RANGE for x, y in spans) and \
-                        all(a[1] <= b[0] for a, b in zip(spans, spans[1:])) and \
-                        (form == "pi" or sum(x in stream_starts for x in st) >= 2):
+                if all(a[1] <= b[0] for a, b in zip(spans, spans[1:])):
                     for k, (x, y) in enumerate(zip(st, en)):
                         out.append(RomRange(x, y, form, "pairs", None, vram + 4 * (i + lead + k)))
                     parallel.update(range(i + lead, i + lead + 2 * half))

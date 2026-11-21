@@ -100,7 +100,8 @@ class PolicyTableTest(unittest.TestCase):
             self.assertGreater(mode.budget, 0)
             for recipes in (mode.cross_recipes or resolvemod.CROSS_RECIPES, mode.recipe_sweep):
                 self.assertLessEqual(recipes * solver.CROSS_DRAFTS, solver.MAX_COMBINATIONS)
-            self.assertFalse(mode.unit_recipes, "nearest-unit retry measured 0/165: off in every mode")
+            if mode.name != "exhaustive":                    # the kitchen sink runs every technique
+                self.assertFalse(mode.unit_recipes, "nearest-unit retry measured 0/165: off below exhaustive")
         self.assertEqual([m.name for m in solver.MODES.values()], ["quick", "normal", "deep", "exhaustive"])
         self.assertLess(solver.MODES["quick"].budget, solver.MODES["normal"].budget)
         self.assertLessEqual(solver.MODES["deep"].budget, solver.MODES["exhaustive"].budget)
@@ -109,6 +110,11 @@ class PolicyTableTest(unittest.TestCase):
         exhaustive = solver.MODES["exhaustive"]
         self.assertEqual((exhaustive.max_size, exhaustive.require_reasons), (0, True))
         self.assertGreater(exhaustive.max_rounds, solver.MODES["deep"].max_rounds)
+        # kitchen sink: nothing skipped to save builds, every opt-in technique on
+        self.assertEqual((exhaustive.recipe_gate, exhaustive.search_economics), (False, False))
+        self.assertTrue(exhaustive.regional_calibration and exhaustive.unit_recipes and exhaustive.region_recipes)
+        self.assertTrue(all(m.recipe_gate and not m.regional_calibration
+                            for m in solver.MODES.values() if m.name != "exhaustive"))
 
     def test_policies_that_break_the_rules_are_refused(self):
         from dataclasses import replace
@@ -226,9 +232,9 @@ class CauseTest(unittest.TestCase):
         boundary = solver.decide(cases[5], mode, observations, model=True)
         self.assertIsNone(boundary.technique)
         self.assertIn("never applied unattended", boundary.reason)
+        # a style fingerprint is not a build test: the stretch still gets the recipe sweep (2026-11-18)
         unknown = solver.decide(cases[0], mode, observations, unknown={cases[0].vram})
-        self.assertEqual((unknown.cause, unknown.technique), ("unknown toolchain", None))
-        self.assertIn("does not reproduce it", unknown.reason)
+        self.assertEqual((unknown.cause, unknown.technique), ("unknown toolchain", "recipe-sweep"))
 
     def test_exclusions_are_recorded_with_their_reason(self):
         mode = solver.MODES["deep"]
@@ -738,6 +744,80 @@ class InvocationTest(unittest.TestCase):
     def test_durations(self):
         self.assertEqual([solver.parse_duration(x) for x in ("90", "90s", "30m", "2h", None)],
                          [90.0, 90.0, 1800.0, 7200.0, None])
+
+
+class SettingFieldsTest(unittest.TestCase):
+    """recipe_gate and regional_calibration: command line > [run] setting > the run's starting mode,
+    and a resume under another --effort keeps the values the run was started with (review A 6-7)."""
+
+    def _gate(self, args, mode, settings):
+        from n64dk.commands import run
+        spec = types.SimpleNamespace(path="/rom.z64", vram_delta=None, delta_source="boot", catalogue="/c.txt",
+                                     catalogue_shift=0, name="main")
+        factory = run.resolve_options_for(args, settings, mode=mode, project=Path("/p"), spec=spec, jobs=2,
+                                          events=Path("/o/events.jsonl"), out=Path("/o"), manifests=[], recipes={},
+                                          recovered=set())
+        return factory().recipe_gate
+
+    def test_one_precedence_rule_for_both_settings(self):
+        exhaustive = solver.policy("exhaustive")
+        args = _parser().parse_args(["--project", "p", "--out", "o", "--effort", "exhaustive"])
+        self.assertIsNone(args.regional_calibration)            # neither flag given: None, not store_false's True
+        solver.apply_policy(args, exhaustive)
+        self.assertEqual(args.mode_settings, {"recipe_gate": False, "regional_calibration": True})
+        self.assertFalse(solver.setting(args, {}, "recipe_gate", exhaustive))
+        self.assertTrue(solver.setting(args, {"recipe_gate": True}, "recipe_gate", exhaustive))
+        self.assertTrue(self._gate(args, exhaustive, {"recipe_gate": True}))           # [run] beats the mode
+        self.assertTrue(solver.setting(args, {}, "regional_calibration", exhaustive))
+        # the old `or` chain kept exhaustive's regional calibration on whatever [run] said
+        self.assertFalse(solver.setting(args, {"regional_calibration": False}, "regional_calibration", exhaustive))
+        explicit = _parser().parse_args(["--project", "p", "--out", "o", "--effort", "exhaustive", "--recipe-gate",
+                                         "--no-regional-calibration"])
+        solver.apply_policy(explicit, exhaustive)
+        off = {"recipe_gate": False, "regional_calibration": True}
+        self.assertTrue(solver.setting(explicit, off, "recipe_gate", exhaustive))      # the command line beats [run]
+        self.assertFalse(solver.setting(explicit, off, "regional_calibration", exhaustive))
+        self.assertTrue(self._gate(explicit, exhaustive, off))
+
+    def test_a_resume_under_another_effort_keeps_the_starting_values(self):
+        from n64dk.commands import run
+        out = _scratch(self)
+        start = _parser().parse_args(["--project", "/p", "--out", str(out)])
+        run.prepare_invocation(start)
+        run.save_invocation(start, out)
+        saved = json.loads((out / "solver" / "invocation.json").read_text())
+        self.assertEqual(saved["mode_settings"], {"recipe_gate": True, "regional_calibration": False})
+        again = _parser().parse_args(["--resume", str(out), "--effort", "exhaustive"])
+        mode = run.prepare_invocation(again)
+        self.assertEqual(mode.name, "exhaustive")
+        self.assertTrue(solver.setting(again, {}, "recipe_gate", mode))                # normal's gate, not exhaustive's
+        self.assertFalse(solver.setting(again, {}, "regional_calibration", mode))
+        self.assertTrue(self._gate(again, mode, {}))
+        self.assertFalse(solver.setting(again, {"recipe_gate": False}, "recipe_gate", mode))   # [run] still wins
+        # and the other way: an exhaustive run continued as normal keeps the gate off
+        kitchen = _scratch(self)
+        first = _parser().parse_args(["--project", "/p", "--out", str(kitchen), "--effort", "exhaustive"])
+        run.prepare_invocation(first)
+        run.save_invocation(first, kitchen)
+        lighter = _parser().parse_args(["--resume", str(kitchen), "--effort", "normal"])
+        mode = run.prepare_invocation(lighter)
+        self.assertEqual((mode.name, solver.setting(lighter, {}, "recipe_gate", mode),
+                          solver.setting(lighter, {}, "regional_calibration", mode)), ("normal", False, True))
+
+    def test_an_invocation_saved_before_the_settings_resumes_with_its_own_mode(self):
+        from n64dk.commands import run
+        out = _scratch(self)
+        first = _parser().parse_args(["--project", "/p", "--out", str(out), "--effort", "exhaustive"])
+        run.prepare_invocation(first)
+        run.save_invocation(first, out)
+        path = out / "solver" / "invocation.json"
+        saved = json.loads(path.read_text())
+        del saved["mode_settings"]                                # as a round-11 run saved it
+        path.write_text(json.dumps(saved))
+        again = _parser().parse_args(["--resume", str(out), "--effort", "deep"])
+        mode = run.prepare_invocation(again)
+        self.assertEqual(mode.name, "deep")
+        self.assertEqual(again.mode_settings, {"recipe_gate": False, "regional_calibration": True})
 
 
 if __name__ == "__main__":

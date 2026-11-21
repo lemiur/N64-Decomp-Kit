@@ -161,6 +161,12 @@ COMPONENTS: tuple[Component, ...] = (
     _c("kmc/as", "assembler", "KMC GNU as (binutils 2.6)", "2.6", "reconstructed", "implemented-verified",
        _DECOMPME, "https://github.com/decompals/mips-binutils-2.6", ("as",), "kmc-gcc-2.7.2", "x86-64 ELF",
        licence="GPL", notes="reorders and fills delay slots itself (.set reorder); encodes move as addu"),
+    _c("gnu/as-2.9", "assembler", "period GNU as 2.9.x (gcc 2.8.1 / egcs 1.1.2 toolchains)", "2.9.1",
+       "reconstructed", "implemented-unvalidated", _DECOMPME, "", ("as",), "gcc2.8.1pm", "x86-64 ELF", licence="GPL",
+       notes="round 12: unlike KMC as 2.6 it makes a symbol declared '.extern name, size' GP-relative under -G "
+             "(probe: bench/analysis gprobe); the kmc+gas lane pairs it with KMC GCC for small-data (-G) code.  "
+             "A period GNU assembler rebuilt for a modern host (reconstructed): that a retail build used it is "
+             "a hypothesis the strict matches it yields support (round 12: 25 strict exact, 0 lost)"),
     _c("kmc/ar", "archiver", "KMC binutils ar", "2.6", "reconstructed", "comparative-only", _DECOMPME,
        "https://github.com/decompals/mips-binutils-2.6", ("ar",), "kmc-gcc-2.7.2", "x86-64 ELF"),
     _c("kit/asn64-converter", "assembler-macro", "kit ASN64-compatible assembly converter", "round 10",
@@ -171,6 +177,11 @@ COMPONENTS: tuple[Component, ...] = (
        notes="emulates an assembler that expands lw/lh/lb rD,sym through $at (seen in retail code; KMC as 2.6, "
              "GNU as 2.9.1, ASN64 2.56/2.72/2.81 and IRIX as all use rD); offered only to functions whose own "
              "code shows the form"),
+    _c("kit/at-branch-macros", "assembler-macro", "kit rewrite of branch comparisons as branch macros", "round 12",
+       "reconstructed", "implemented-unvalidated", "n64dk/match/normalize.py (at_branch_macros)", "", (), "", "Python",
+       notes="slt/sltu/slti/sltiu into a register that only feeds bne/beq against $0 becomes blt/bge/bltu/bgeu, "
+             "which every probed assembler expands through $at (bench/macros); applied only when the register is "
+             "dead on both paths; offered only to functions whose own code shows comparisons through $at"),
     _c("binutils/as", "assembler", "GNU as (modern binutils, mips-linux-gnu)", "2.42", "reconstructed",
        "implemented-verified", "distribution package", "", ("usr/bin/mips-linux-gnu-as",), "mips-binutils",
        "x86-64 ELF", licence="GPL", notes="encodes move as or; used with --no-pad-sections behind converters"),
@@ -309,6 +320,16 @@ RECIPES: dict[str, Recipe] = {
                                                     "assembly text", "symbol loads through $at (emulated assembler)"),
                                               Stage("assemble", "kmc/as", (), "assembly text", "ELF relocatable",
                                                     "reorder on")])),
+    "kmc+asg": Recipe("kmc+asg", _kmc([Stage("assemble", "kmc/as", (), "assembly text", "ELF relocatable",
+                                             "-G from the compiler's -G")])),
+    "kmc+gas": Recipe("kmc+gas", _kmc([Stage("assemble", "gnu/as-2.9", (), "assembly text", "ELF relocatable",
+                                             "-G from the compiler's -G")])),
+    "kmc+atmacro": Recipe("kmc+atmacro", _kmc([Stage("expand", "kit/at-symbol-loads", (), "assembly text",
+                                                     "assembly text", "symbol loads through $at (emulated assembler)"),
+                                               Stage("expand", "kit/at-branch-macros", (), "assembly text",
+                                                     "assembly text", "branch comparisons through $at"),
+                                               Stage("assemble", "kmc/as", (), "assembly text", "ELF relocatable",
+                                                     "reorder on")])),
     "kmc+asn64": Recipe("kmc+asn64", _kmc([Stage("convert", "kit/asn64-converter", (), "assembly text",
                                                   "assembly text"),
                                             Stage("assemble", "binutils/as", ("--no-pad-sections",), "assembly text",
@@ -395,11 +416,12 @@ def inspect(root: Path | None, digests: bool = True) -> list[dict]:
     return out
 
 
-def recipe_identity(recipe: Recipe, root: Path | None, flags: list[str] | None = None) -> dict:
+def recipe_identity(recipe: Recipe, root: Path | None, flags: list[str] | None = None,
+                    inspected: list[dict] | None = None) -> dict:
     """The recipe with every stage's component digests, and one SHA-256 over all of it (stage
     order, components, file digests, flags, environment).  Two recipes with the same identity
     build the same way; two labels that share all but one component differ by that stage."""
-    rows = {row["ident"]: row for row in inspect(root)}
+    rows = {row["ident"]: row for row in (inspected if inspected is not None else inspect(root))}
     stages = []
     for stage in recipe.stages:
         row = rows.get(stage.component)
@@ -427,7 +449,9 @@ def shared_stages(a: str, b: str) -> dict:
 
 
 def catalogue_json(root: Path | None, digests: bool = True) -> dict:
+    rows = inspect(root, digests)                     # once: every recipe reads the same inspection
+    with_digests = rows if digests else inspect(root)
     return {"provenance_classes": PROVENANCE, "dispositions": DISPOSITIONS, "roles": ROLES,
-            "components": inspect(root, digests),
-            "recipes": {lane: recipe_identity(recipe, root) for lane, recipe in RECIPES.items()},
+            "components": rows,
+            "recipes": {lane: recipe_identity(recipe, root, inspected=with_digests) for lane, recipe in RECIPES.items()},
             "host_components": HOST_COMPONENTS}

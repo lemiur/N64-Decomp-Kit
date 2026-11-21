@@ -14,12 +14,14 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .. import mips
-from ..elf import R_MIPS_26, R_MIPS_32, R_MIPS_HI16, R_MIPS_LO16, Elf
+from ..elf import GP_RELATIVE, GP_SYMBOL, R_MIPS_26, R_MIPS_32, R_MIPS_HI16, R_MIPS_LO16, Elf
 from . import diff as diffmod
 from .symbols import SymbolMap
 
 ALIASES = {".rdata": ".rodata", ".rodata": ".rdata", ".sdata": ".data"}
-COMPARED = (".rodata", ".data")
+# owned initialized sections compared byte for byte (small data, ``-G``: ``.sdata`` and the
+# literal pools ``.lit4``/``.lit8``; ``.bss``/``.sbss`` hold no bytes)
+COMPARED = (".rodata", ".data", ".sdata", ".lit4", ".lit8")
 
 
 def find_section(elf: Elf, name: str):
@@ -47,6 +49,7 @@ class Relocation:
     section: str | None   # defining section of the symbol (None if external)
     value: int            # symbol value inside its section
     addend: int           # REL addend from the instruction (low half for HI/LO)
+    local: bool = False   # STB_LOCAL or a section symbol: GP-relative fields include the object's GP0
 
 
 def relocations(elf: Elf, section: str) -> list[Relocation]:
@@ -62,6 +65,8 @@ def relocations(elf: Elf, section: str) -> list[Relocation]:
         if addend is None:
             if rtype in (R_MIPS_HI16, R_MIPS_LO16):
                 addend = (word & 0xFFFF) - (0x10000 if word & 0x8000 and rtype == R_MIPS_LO16 else 0)
+            elif rtype in GP_RELATIVE:
+                addend = (word & 0xFFFF) - (0x10000 if word & 0x8000 else 0)
             elif rtype == R_MIPS_26:
                 addend = (word & 0x3FFFFFF) << 2
             elif rtype == R_MIPS_32:
@@ -69,7 +74,7 @@ def relocations(elf: Elf, section: str) -> list[Relocation]:
             else:
                 addend = 0
         name = sym.name or (sname or "")
-        out.append(Relocation(off, rtype, name, sname, sym.value, addend))
+        out.append(Relocation(off, rtype, name, sname, sym.value, addend, sym.bind == 0 or sym.type == 3))
     return out
 
 
@@ -103,8 +108,20 @@ def infer_from_rom(elf: Elf, target: bytes, vram: int, bases: dict[str, int],
         elif kind == "symbol":
             sym_votes.setdefault(rel.symbol, Counter())[(address - addend) & 0xFFFFFFFF] += 1
 
+    # ``symbols`` may be a plain dict (the donor stage passes ``{}``); dict.get never infers a name
+    gp = dict.get(symbols, GP_SYMBOL) if isinstance(symbols, dict) else None
+    gp0 = elf.gp0()
     for rel in relocations(elf, ".text"):
         key = (rel.symbol, rel.section, rel.value)
+        if rel.type in GP_RELATIVE:
+            # the retail field is T = S + A (+ GP0 for a local symbol) - GP, read from the
+            # instruction at the relocated offset; only with a declared _gp
+            word = rom_word(rel.offset)
+            if gp is None or word is None or wanted(rel) is None:
+                continue
+            field = (word & 0xFFFF) - (0x10000 if word & 0x8000 else 0)
+            vote(rel, gp + field, rel.addend + (gp0 if rel.local else 0))
+            continue
         if rel.type == R_MIPS_HI16:
             pending.setdefault(key, []).append(rel)
         elif rel.type == R_MIPS_LO16:
@@ -157,7 +174,8 @@ def section_candidates(elf: Elf, name: str, rom: bytes, rom_lo: int, rom_hi: int
         return []
     data = bytearray(sec.data)
     # relocated words keep the bits the relocation does not touch (opcode and registers)
-    keep = {R_MIPS_HI16: 0xFFFF0000, R_MIPS_LO16: 0xFFFF0000, R_MIPS_26: 0xFC000000}
+    keep = {R_MIPS_HI16: 0xFFFF0000, R_MIPS_LO16: 0xFFFF0000, R_MIPS_26: 0xFC000000,
+            **{rtype: 0xFFFF0000 for rtype in GP_RELATIVE}}
     masked = {r.offset: keep.get(r.type, 0) for r in relocations(elf, sec.name)}
     end = len(data)
     while end >= 4 and data[end - 4:end] == b"\0\0\0\0" and end - 4 not in masked:
@@ -306,10 +324,12 @@ def compare_object(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int 
             break
     assert best is not None
     if compare_sections:
+        done = set()
         for name in COMPARED:
             sec = find_section(elf, name)
-            if sec is None or not sec.size:
+            if sec is None or not sec.size or sec.name in done:
                 continue
+            done.add(sec.name)
             base = best.bases.get(sec.name, best.bases.get(name))
             if base is None:
                 continue

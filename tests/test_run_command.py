@@ -170,3 +170,86 @@ class ResumeSweepTest(unittest.TestCase):
             store.close()
         self.assertEqual(finished_cases(root, "main"), {0x80001000})
         self.assertEqual(finished_cases(root / "missing", "main"), set())
+
+
+class ProjectGpTest(unittest.TestCase):
+    def test_the_project_gp_comes_from_the_files_the_resolver_reads(self):
+        project = Path(_scratch())
+        (project / "match.txt").write_text("_gp = 0x80100000;\nfunc_a = 0x80000400;\n")
+        (project / "run.txt").write_text("_gp = 0x80200000;\n")
+        (project / "n64dk.toml").write_text('[match]\nsymbols = ["match.txt"]\n')
+        self.assertEqual(run.project_gp(project, "main"), 0x80100000)       # [match] symbols, as the resolver
+        (project / "n64dk.toml").write_text('[match]\nsymbols = ["match.txt"]\n[run]\nsymbols = ["run.txt"]\n')
+        self.assertEqual(run.project_gp(project, "main"), 0x80200000)       # [run] symbols win, as in a run
+        (project / "n64dk.toml").write_text('[run]\nsymbols = ["missing.txt"]\n')
+        self.assertIsNone(run.project_gp(project, "main"))
+
+    def test_a_run_without_a_value_leaves_no_gp_file_behind(self):
+        out = Path(_scratch())
+        self.assertEqual(run.write_gp_symbols(out, None), [])                 # nothing there: no error
+        written = run.write_gp_symbols(out, "_gp = 0x80100000;\n")
+        self.assertEqual(Path(written[0]).read_text(), "_gp = 0x80100000;\n")
+        self.assertEqual(run.write_gp_symbols(out, None), [])                 # --small-data off afterwards
+        self.assertFalse((out / "small_data" / "gp_symbols.txt").exists())
+
+
+class SmallDataProvenanceTest(unittest.TestCase):
+    """Functions verified against a _gp recovered from code are reported as such (strict verification
+    itself is unchanged)."""
+
+    def test_exact_cases_in_the_small_data_lanes_are_counted(self):
+        from types import SimpleNamespace
+        cases = [SimpleNamespace(status=status, recipe=recipe) for status, recipe in (
+            ("exact", "kmc+asg -O2 -G8"), ("exact", "kmc+gas -O2 -G8"), ("exact", "kmc+as -O2"),
+            ("assumed", "kmc+asg -O2 -G8"), ("open", "kmc+gas -O2 -G8"), ("exact", None))]
+        self.assertEqual(run.small_data_lane_exact(cases), 2)
+
+    def test_the_report_says_where_the_gp_came_from(self):
+        recovered = {"value": "0x80100000", "confidence": "high", "reason": None, "sites": 2}
+        run.note_small_data(recovered, 3, True)
+        self.assertEqual((recovered["gp_source"], recovered["exact_small_data_lane"]), ("recovered", 3))
+        self.assertIn("small_data/gp_symbols.txt", recovered["gp_note"])
+        declared = {"value": "0x80100000", "confidence": "high", "project_gp": "0x80100000"}
+        run.note_small_data(declared, 3, True)
+        self.assertEqual(declared["gp_source"], "project")
+        self.assertNotIn("gp_note", declared)
+        unreadable = {"value": "0x80100000", "confidence": "high", "project_gp_error": "OSError: x"}
+        run.note_small_data(unreadable, 1, True)
+        self.assertEqual(unreadable["gp_source"], "unknown")
+        low = {"value": "0x80100000", "confidence": "low"}             # not declared to the resolver
+        run.note_small_data(low, 0, False)
+        self.assertEqual((low["gp_source"], low["exact_small_data_lane"]), (None, 0))
+        run.note_small_data(None, 1, True)                              # --small-data off: no entry, no error
+        run.note_small_data({"error": "ValueError: x"}, 0, False)
+
+    def test_the_markdown_report_names_the_gp_source(self):
+        recovered = {"value": "0x80100000", "confidence": "high"}
+        run.note_small_data(recovered, 3, True)
+        text = run._markdown({"project": "/p", "images": {}, "small_data": recovered})
+        self.assertIn("_gp 0x80100000, recovered from the code that sets $gp", text)
+        self.assertIn("3 exact functions built in a small-data lane", text)
+        declared = {"value": "0x80100000", "project_gp": "0x80100000", "warning": "the project declares _gp"}
+        run.note_small_data(declared, 0, True)
+        text = run._markdown({"project": "/p", "images": {}, "small_data": declared})
+        self.assertIn("declared by the project", text)
+        self.assertIn("WARNING: the project declares _gp", text)
+        self.assertNotIn("Small data", run._markdown({"project": "/p", "images": {}}))
+
+
+class HeadlineTest(unittest.TestCase):
+    def test_observation_errors_are_reported_apart_from_failures(self):
+        item = {"functions": 3, "solver": {"observation_error": "ValueError: x"}, "resolve": {"statuses": {}},
+                "donors": {"error": "boom"}}
+        head = run._headline(item)
+        self.assertEqual(head["errors"], ["donors"])
+        self.assertEqual(head["observation_errors"], ["solver"])
+
+
+class SkipStageTest(unittest.TestCase):
+    def test_calibration_can_be_skipped(self):
+        # run.py consults "calibrate" in skip_stage; the parser must accept it (round 12 ablation finding)
+        import argparse
+        parser = argparse.ArgumentParser()
+        run.decompile_run.arguments(parser)
+        args = parser.parse_args(["--project", "/nonexistent", "--out", "/nonexistent/out", "--skip-stage", "calibrate"])
+        self.assertEqual(args.skip_stage, ["calibrate"])

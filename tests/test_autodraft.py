@@ -45,6 +45,20 @@ class EmitTest(unittest.TestCase):
         self.assertIn("glabel jtbl_800887D0", text)
         self.assertIn(f".word .L{base + 0x1C:08X}", text)
 
+    def test_jump_table_in_another_image_is_found_through_it(self):
+        """An overlay's table may stand in the resident image: the function's own image does not hold it."""
+        base = 0x80101000
+        code = asm(0x3C018000, 0x00220821, 0x8C2229B0, 0x00400008, 0x00000000,   # lw v0,0x800029B0(at); jr v0
+                   0x03E00008, 0x24020001, 0x03E00008, 0x24020002)
+        resident = bytes(0x29B0) + asm(base + 0x14, base + 0x1C, 0)               # first byte at 0x80000000
+        self.assertEqual(m2c_bridge.find_jump_tables(code, base, base, len(code)), [])
+        tables = m2c_bridge.find_jump_tables(code, base, base, len(code), also=[(resident, 0x80000000)])
+        self.assertEqual(tables, [(0x800029B0, [base + 0x14, base + 0x1C])])
+        # the function's own image answers for the addresses it holds, whatever stands behind it
+        shadow = bytes(base - 0x80000000) + asm(*([0xFFFFFFFF] * 9))
+        self.assertEqual(m2c_bridge.find_jump_tables(code, base, base, len(code), also=[(shadow, 0x80000000), (resident, 0x80000000)]),
+                         tables)
+
     def test_external_branch_has_faithful_and_liftable_forms(self):
         base = 0x80001000
         code = asm(0x10000007, 0x00000000)  # b 0x80001020; nop

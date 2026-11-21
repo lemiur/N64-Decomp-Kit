@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 R_MIPS_32, R_MIPS_26, R_MIPS_HI16, R_MIPS_LO16, R_MIPS_PC16 = 2, 4, 5, 6, 10
+R_MIPS_GPREL16, R_MIPS_LITERAL = 7, 8
+GP_RELATIVE = (R_MIPS_GPREL16, R_MIPS_LITERAL)
+GP_SYMBOL = "_gp"
 
 
 @dataclass
@@ -83,6 +86,14 @@ class Elf:
                 out.append((r_off, r_info & 0xFF, r_info >> 8, addend))
         return out
 
+    def gp0(self) -> int:
+        """The GP value the assembler assumed (``.reginfo`` ``ri_gp_value``): GP-relative addends of
+        local symbols are relative to it (KMC ``as`` 2.6 writes 0x4000; GNU ``as`` 2.9 writes 0)."""
+        reginfo = self.section(".reginfo")
+        if reginfo is None or len(reginfo.data) < 24:
+            return 0
+        return struct.unpack_from(">i", reginfo.data, 20)[0]
+
     def relocate(self, name: str, bases: dict[str, int], symbols: dict[str, int]) -> bytes:
         """Return section ``name`` with MIPS relocations applied.
 
@@ -90,6 +101,10 @@ class Elf:
         ``symbols`` maps external symbol names to addresses.  HI16/LO16 pairs follow the
         MIPS ABI: in relocation-table order, a HI16 takes its addend from the next LO16
         *of the same symbol* (scheduled IDO code interleaves HI16s of different symbols).
+        ``R_MIPS_GPREL16`` and ``R_MIPS_LITERAL`` (small data, ``-G``) resolve against the program's
+        ``_gp``, which must be in ``symbols`` (an independently established, declared value): the
+        field becomes ``A + S + GP0 - GP`` for a local symbol and ``A + S - GP`` for an external
+        one, and a value outside the signed 16-bit range is an error, never truncated.
         """
         sec = self.section(name)
         if sec is None:
@@ -139,6 +154,19 @@ class Elf:
                 if distance & 3 or not -0x20000 <= distance < 0x20000:
                     raise ValueError(f"branch out of range at 0x{off:X} in {name}")
                 struct.pack_into(">I", buf, off, (word & 0xFFFF0000) | ((distance >> 2) & 0xFFFF))
+            elif rtype in GP_RELATIVE:
+                if GP_SYMBOL not in symbols:
+                    raise KeyError(f"undefined symbol {GP_SYMBOL} (GP-relative relocation at 0x{off:X} in {name})")
+                gp = symbols[GP_SYMBOL]
+                held = word & 0xFFFF
+                held = (held - 0x10000 if held & 0x8000 else held) if addend is None else addend
+                symbol = self.symbols[sidx]
+                local = symbol.bind == 0 or symbol.type == 3          # STB_LOCAL or a section symbol
+                value = held + s + (self.gp0() if local else 0) - gp
+                if not -0x8000 <= value < 0x8000:
+                    raise ValueError(f"GP-relative relocation out of range at 0x{off:X} in {name}: "
+                                     f"0x{(s + held) & 0xFFFFFFFF:08X} is {value} from _gp")
+                struct.pack_into(">I", buf, off, (word & 0xFFFF0000) | (value & 0xFFFF))
             else:
                 raise ValueError(f"unsupported relocation type {rtype} at 0x{off:X} in {name}")
         if pending_hi:

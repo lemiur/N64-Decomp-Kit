@@ -335,3 +335,128 @@ def pad(source: str, name: str, size: int, where: str = "top") -> str | None:
     at = first if where == "top" else last
     offset = body_start + sum(len(text) + 1 for text in lines[:at])
     return source[:offset] + line + source[offset:]
+
+
+# ---------------------------------------------------------------------------------------------
+# Local-free form (IDO).  A draft that copies structure fields into locals and refreshes them
+# after every store (``wpos = s->f; used = wpos - s->g; ... s->f += k; wpos = s->f;``) states
+# the same values as one that reads the fields where they are used, but it gives the compiler
+# other live ranges: IDO 5.3 happened to produce the same code for both, IDO 7.1 did not, and
+# the original was written without the locals (Sesame Street, func_80069504: the cached form
+# never matched in ~700 attempts; the local-free form matched under IDO 7.1 at once).  The
+# form is computed, not searched for:
+#
+# * ``x = A op k; A = x;`` becomes ``A op= k; x = A;`` (the store folded, the refresh kept);
+# * ``x = A op= k;`` is the store plus a refresh ``x = A``;
+# * a local whose every assignment gives it the same field expression (no calls, no other
+#   local), and which is never read before its first assignment, is replaced at each read by
+#   that expression and its assignments are dropped.
+#
+# Re-reading a field where the draft read a copy is the usual reading of such a draft, not a
+# proven equivalence (a store through another pointer could intervene), so the form is marked
+# for semantic review; whether it is closer is decided by building it.
+
+_ATOM = re.compile(r"[A-Za-z_]\w*(?:(?:->|\.)\w+|\[[^\[\]]*\])*")
+_IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
+_LOCAL_DECL = re.compile(r"(?m)^[ \t]+(?:(?:volatile|register|unsigned|signed)\s+)*(?:s8|u8|s16|u16|s32|u32|int|"
+                         r"short|char|long|f32|f64|float|double)\s+(\w+);[ \t]*\n")
+
+
+def _field_expression(text: str) -> bool:
+    return ("->" in text or "." in text or "[" in text) and not re.search(r"\w\s*\(|\+\+|--|[^=!<>]=(?!=)", text)
+
+
+def local_free(source: str, name: str, limit: int = 32, refreshed_only: bool = False) -> tuple[str, list[str]]:
+    """The draft with locals that only cache field loads replaced by the fields.  Returns
+    (text, applied); (source, []) when nothing applies.  ``refreshed_only``: only the locals the
+    draft assigns more than once (a copy refreshed after stores), keeping single loads."""
+    span = _iterate._function_span(source, name)
+    if span is None:
+        return source, []
+    start, body_start, end = span
+    head, body = source[start:body_start], source[body_start:end]
+    applied: list[str] = []
+    # x = A op k; A = x;   ->   A op= k; x = A;
+    fold = re.compile(r"(?m)^([ \t]*)(\w+) = (" + _ATOM.pattern + r") ([-+*/&|^]|<<|>>) ([^;\n]+);\n"
+                      r"\1(\3) = \2;\n")
+
+    def folded(found):
+        applied.append(f"local-free: fold {found.group(3)} {found.group(4)}= into a store")
+        indent, x, field, op, k = found.group(1), found.group(2), found.group(3), found.group(4), found.group(5)
+        return f"{indent}{field} {op}= {k};\n{indent}{x} = {field};\n"
+    body = fold.sub(folded, body)
+    # x = A op= k;   ->   A op= k; x = A;
+    chain = re.compile(r"(?m)^([ \t]*)(\w+) = (" + _ATOM.pattern + r") ((?:[-+*/&|^]|<<|>>)?=) ([^;\n]+);\n")
+    def chained(found):
+        if not _field_expression(found.group(3)):
+            return found.group(0)                          # only stores into a field are split
+        indent, x, field = found.group(1), found.group(2), found.group(3)
+        applied.append(f"local-free: split {x} = {field} {found.group(4)} ...")
+        return f"{indent}{field} {found.group(4)} {found.group(5)};\n{indent}{x} = {field};\n"
+    body = chain.sub(chained, body)
+    locals_ = [m.group(1) for m in _LOCAL_DECL.finditer(body)]
+    parameters = set(_IDENT.findall(head))
+    for _round in range(limit):
+        changed = False
+        for var in list(locals_):
+            v = re.escape(var)
+            own = rf"(?<!->)(?<!\.)\b{v}\b"          # the local, not a field of that name
+            if re.search(rf"(?<!&)&(?!&)\s*{v}\b|{own}\s*(?:\+\+|--|[-+*/&|^]=|<<=|>>=)|(?:\+\+|--)\s*{v}\b", body):
+                continue
+            assignments = list(re.finditer(rf"(?m)^[ \t]*{v} = ([^;\n]+);[ \t]*\n", body))
+            if not assignments:
+                continue
+            values = {a.group(1).strip() for a in assignments}
+            if len(values) != 1 or (refreshed_only and len(assignments) < 2):
+                continue
+            value = values.pop()
+            names = set(_IDENT.findall(re.sub(r"(?:->|\.)\w+", "", value)))
+            if not _field_expression(value) or names & set(locals_) or var in names:
+                continue
+            if any(re.search(rf"(?m)^[ \t]*{re.escape(n)} = ", body) for n in names if n in parameters):
+                continue                                   # the base pointer itself changes
+            declaration = next(m for m in _LOCAL_DECL.finditer(body) if m.group(1) == var)
+            rest = body[declaration.end():]
+            first_use = re.search(own, rest)
+            first_write = re.search(rf"(?m)^[ \t]*{v} = ", rest)
+            if first_use is None or first_write is None or first_use.start() != first_write.end() - len(var) - 3:
+                continue                                   # read before its first assignment
+            for a in reversed(assignments):
+                body = body[:a.start()] + body[a.end():]
+            body = re.sub(rf"(?m)^[ \t]+(?:(?:volatile|register|unsigned|signed)\s+)*\w+\s+{v};[ \t]*\n", "", body,
+                          count=1)
+            replacement = value if _ATOM.fullmatch(value) else f"({value})"
+            body = re.sub(own, lambda _m: replacement, body)
+            locals_.remove(var)
+            applied.append(f"local-free: {var} -> {value}")
+            changed = True
+        if not changed:
+            break
+    if not any(label.startswith("local-free: ") and " -> " in label for label in applied):
+        return source, []
+    return source[:body_start] + body + source[end:], applied
+
+
+def local_free_drafts(source: str, name: str) -> list[tuple[str, str, bool]]:
+    """``[(label, text, needs_review)]``: the refreshed copies removed, then every cached field."""
+    out, seen = [], {source}
+    for label, refreshed in (("local-free", True), ("local-free+", False)):
+        text, applied = local_free(source, name, refreshed_only=refreshed)
+        if applied and text not in seen:
+            seen.add(text)
+            out.append((label, text, True))
+    return out
+
+
+_shaped_drafts = drafts
+
+
+def drafts(source: str, name: str) -> list[tuple[str, str, bool]]:          # noqa: F811
+    """As above, plus the ``local-free`` forms (cached field copies read in place)."""
+    out = _shaped_drafts(source, name)
+    seen = {source} | {text for _label, text, _review in out}
+    for label, text, review in local_free_drafts(source, name):
+        if text not in seen:
+            seen.add(text)
+            out.append((label, text, review))
+    return out

@@ -131,6 +131,9 @@ export, and proof boundaries.
 | `toolchain-regions --project PROJECT --out DIR` | Reconstruct ranked compiler/assembler regions, component mismatches and open-set unknown-toolchain dossiers |
 | `decompile-run ... --effort quick\|normal\|deep\|exhaustive`, `--resume DIR`; `decompile-status DIR` | Effort modes, cause-driven later rounds to a fixed point under time/build/model-call budgets, resume, read-only round table and per-function hard-queue dossiers (default `normal` is the single pass above) |
 | `decompile-batch ROM... --out DIR` | Process titles sequentially and share only independently verified donor results |
+| `decompile-everything ROM... --out DIR` | Everything for a set of ROMs: init, run at the kitchen-sink effort (`exhaustive`), library sharing, export and status per title, one title at a time, resumable |
+| `decompile-run ... --small-data auto\|off` | Small data (`-G`): the program's `_gp` from the code that sets `$gp`, GP-relative relocations, and the small-data assembler lanes `kmc+asg`/`kmc+gas` for functions that address through `$gp` (default `auto`; titles that never set `$gp` are unchanged) |
+| `discovery-audit ... --overlays` | Also infer per-overlay bases inside segments that hold several separately linked overlays (a report; never applied to a catalogue) |
 | `decompile-export --project PROJECT --run DIR --out DIR` | Export every function with honest C/assembly/unresolved provenance and full ROM-byte coverage |
 | `source-donor TREE --project PROJECT` | Measure an existing C source tree and split verified translation units into reusable per-function donors |
 | `sdk-donor TREE --out DIR` | Build version/flavour-specific libultra donor descriptions |
@@ -247,6 +250,70 @@ server amortizes Python import cost while retaining a fresh child per draft; set
 `N64DK_M2C_SERVER=0` to use one command-line process per draft.
 
 Run `n64dk COMMAND --help` for every option.
+
+### Round 12 closeout: what ships in decompile-run
+
+`decompile-run` runs these steps for each image, in this order. Each line gives the switch and the default.
+
+| Step | What it does | Switch | Default |
+|---|---|---|---|
+| Machine guard | One heavy n64dk job at a time; refuses under the memory and disk floors | `--wait-for-lock`, `--force-resources` | refuse when busy; floors enforced |
+| Blind run | Refuses (exit 3) before any stage when a forbidden tree is reachable from the configuration, project or environment; checks again at the end; refuses a run directory that held non-blind state; receipts in `solver/blind_*.json` | `--blind-forbid TREE` (repeatable), `--blind-walk-limit N`, `--blind-shared-library MANIFEST@sha256:HEX` | off; walk limit 50,000 (a walk that stops short refuses the run, so large toolchain trees need a higher limit) |
+| Run modes | `blind`: the title's corpus trees forbidden, self-donors and other revisions refused, title-defined names refused in the project's metadata; `research`: only the title's trees forbidden; `source-tree`: allowed and recorded. Recorded in `solver/run_mode.json`; a run directory is reused only by a mode that ranks at or above every earlier session | `--mode blind\|research\|source-tree`, `--corpus-manifest`, `--title` | off (no mode) |
+| Run-directory provenance | Every run records in `solver/blind_provenance.json` whether it was blind | — | always |
+| Discovery gate | Audits each catalogue against call, pointer and prologue evidence; repair adds evidence-backed functions to a copy in the run directory, never the project | `--discovery repair\|audit\|off`, `--skip-stage discovery` | `repair` |
+| Small data (`-G`) | Recovers `_gp` from the code that sets `$gp`; writes `small_data/gp_symbols.txt`; offers the `kmc+asg` and `kmc+gas` lanes to functions that address through `$gp`; reports a disagreeing project `_gp` (the project's value is used) | `--small-data auto\|off` | `auto` (titles that never set `$gp` are unchanged) |
+| Boundaries | Boundary operations report (`boundary_operations.json`); applies nothing | `--skip-stage boundaries` | on |
+| Donors | Transplants verified donor units from source trees, SDK donors and a library of earlier runs. An address that only the unit's own retail bytes support is never declared: the unit waits for an independent declaration | `--donors TOML`, `--library DIR`, `--donor`, `--exclude-donor`, `--skip-stage donors`, `--skip-stage rodata-settlement` | runs only when donors or a library are given |
+| Calibration | Measures the title's recipe on a sample of its functions; when none is asked for and the code's marks contradict the configured recipe on ≥ 40% of the image, samples 96 | `--calibrate N`, `--skip-stage calibrate`, `--regional-calibration` / `--no-regional-calibration` | `[run] calibrate`, else 0 (recipe doubt still applies); regional off except `--effort exhaustive` |
+| Resolve | Per function: m2c drafts with context, the draft portfolio, recipe selection, drafts × recipes, frame fit, twins, hand-written assembly, variant search, strict verification | `--budget`, `--search-ceiling`, `--no-recipe-gate`, `--region-recipes`, `--unit-recipes`, `--search-economics`, `--skip-unknown-search`, `--max-size`, `--limit`, `--only-names` | budget 200, search ceiling 40, recipe gate on, region/unit recipes off, economics off |
+| Assembler lanes | `kmc+atload` when the function loads through `$at` (evidence-gated); `kmc+atmacro` for `$at` branch comparisons | `--skip-stage at-loads`; `N64DK_AT_MACROS=1` | atload on; atmacro off |
+| Variant search | Stops at once from a perfect start (no variant could be adopted); the e-graph family is opt-in | `--skip-stage search`, `N64DK_EGRAPH=1` | on; e-graph off |
+| Declare | Declares self-describing data addresses that byte-identical cases wait for, and verifies those cases again | `--declare-assumed`, `--skip-stage declare` | `[run] declare_assumed`, else off |
+| Later rounds | Fixed-point rounds of search, recipe sweep, declare and refine | `--effort quick\|normal\|deep\|exhaustive`, `--rounds`, `--schedule`, `--budget-time`, `--budget-builds`, `--budget-model-calls` | `normal`: one round |
+| Refiner | An external author for unresolved cases | `--refine-command`, `--skip-stage refine` / `round-refine` | none configured: skipped |
+| Strict queue, toolchain regions, dossiers | Exports strictly verified cases; per-region recipe evidence; a primary cause per unresolved case | `--strict-only` | on |
+| Data settlement | One ownership model over ROM, image and runtime spaces (`.bss`/`.sbss` own no ROM bytes); declared and inferred `_gp` kept apart; waiting data references grouped and placed from independent evidence only; `replay` re-verifies the cases whose every need is established | `--data-stage off\|report\|replay` | off |
+| Unresolved dossier | For every unsettled function: reason, eligible next techniques, measured cost (or "unmeasured"), the evidence that would justify a retry, and a technique ledger | — | always (report-only); `UNRESOLVED.md` in the export |
+| Byte ledger | `ownership.tsv` from the project's manifests over the catalogue | `--skip-stage ledger` | on |
+| Library registration | Registers this run's strictly exact functions as donors for other titles | `--library DIR` | off |
+| Proof receipts | A replayable receipt per settled result: generated C, assembly and donor units. Replay binds the offered recipe's pins and section bases; a self-derived pin origin never makes a strict proof | `--receipts` | off (or run `issue-receipts` later) |
+| Ablation | 20 subsystems can be switched off for a measurement; the run records what it disabled in `report.json` `ablation`, and refuses a filled case store or a resume under other switches | `--skip-stage NAME` or `N64DK_DISABLE_<NAME>=1` | everything on |
+| Resume | Continues from the case store and `rounds.jsonl`; refuses to add `--blind-forbid` or change switches | `--resume RUN_DIR` | — |
+| Resources | Worker processes and parallel builds | `--workers`, `--jobs`, `--worker-memory-mb`, `--memory-reserve-mb` | automatic; at most 4 builds |
+
+Custom lanes always build with `TMPDIR` set to their private build directory. Opt-in experiments pending their
+measurements: `N64DK_LAYOUT_INFER=1` (array and struct-field declarations for optimised drafts) and
+`N64DK_DECLARE_MEMO=1` (skip re-verifying unchanged assumed cases in later declare passes).
+
+Not part of `decompile-run` (separate commands or libraries, none grants credit): reason codes (`decompile-export`),
+`verify-run` / `verify-export`, `relink-image` and `relink-cartridge` (link one image or the whole ROM from a
+generated project and compare it byte for byte, keeping linked, repacked and preserved bytes apart), `decompile-project`, `link-layout`, `discovery-audit --overlays` and
+`--indirect`, the behaviour oracle, translation validation, the similarity index, the data-object solver
+(`datasolve`), RSP/IPL3 identification (`rspid`), the RSP disassembler/assembler (`rspasm`), codec-boundary classification
+(`codecboundary`), calibration, the dashboard and the review commands.
+
+## Checking, reviewing and packaging results
+
+These commands never grant match credit; strict byte identity stays the only credit.
+
+- `issue-receipts RUN`, `verify-receipt`, `verify-run RUN`, `verify-export EXPORT`: proof receipts.
+  Each settled result is rebuilt in a fresh directory and verified strictly. The receipt records
+  the source, recipe, toolchain, declarations and comparison digests. Replaying a receipt rebuilds
+  and compares again. A tampered receipt is rejected.
+- `decompile-dashboard RUN --out DIR`: a self-contained, read-only HTML page of a run. It holds no
+  ROM bytes and no machine paths.
+- `review-queue`, `review-show`, `review-decide`: review assumed, near and donor items. Accepting
+  an item as exact requires `--verify`.
+- `link-layout` and `decompile-project`: a hypothesis of the original link order, and a
+  maintainable project generated from an export. Generating twice gives identical output.
+- `blind-check`: checks, at the moment it runs, that no forbidden source tree is reachable from a run's configuration, project or environment (paths, symlinks, byte copies); it cannot see a path computed inside a process, a network fetch or knowledge copied by hand. For enforcement during a run use `decompile-run --blind-forbid` or `--mode blind`.
+- `migrate --check`, `release-info`: schema and version compatibility of runs, stores and caches.
+- `doctor --host`: what is installed and what is missing.
+
+Worked, executable examples are in [docs/workflows.md](docs/workflows.md). Every option of every
+command is in [docs/cli-reference.md](docs/cli-reference.md), which is generated from the parser
+and checked by the test suite.
 
 ## Library use
 

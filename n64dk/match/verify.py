@@ -12,7 +12,8 @@ skips sections without a base and forgives a candidate's trailing zeros.
 ``exact``          every relocation was resolved from independent declared information (symbol
                    files, manifest ``--symbol``/``--section-base``, or symbols defined by other
                    verified units; never candidate source markers or address-bearing names) and every owned
-                   byte of ``.text`` and of each non-empty ``.rodata``/``.data`` is equal;
+                   byte of ``.text`` and of each non-empty ``.rodata``/``.data`` is equal, and no
+                   owned section carries non-zero bytes past its owned size;
 ``assumed``        the bytes are equal only after taking some addresses from the retail words.
                    Each assumption is listed (symbol or section, address, sites) so it can be
                    reviewed and written into the symbol file, after which the unit is ``exact``;
@@ -21,19 +22,29 @@ skips sections without a base and forgives a candidate's trailing zeros.
                    units need different addresses for one symbol, a call lands on an address
                    that is not a function start);
 
-plus ``unverified-data`` notes for non-empty data sections that could not be compared.
+plus ``unverified-data`` notes for non-empty data sections that could not be compared, and for
+every other section the object loads into the image (``SHT_PROGBITS`` with ``SHF_ALLOC``, such as
+``.ctors`` or a second read-only section): those are never compared, so never ignored either.
+``.bss``/``.sbss`` (``SHT_NOBITS``) hold no bytes; nothing is claimed about them.
 
 Nothing here weakens or replaces exploration; it is what integration and progress reporting
 should require.
 """
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass, field
 
-from ..elf import R_MIPS_26, Elf
+from ..elf import GP_SYMBOL, R_MIPS_26, Elf
 from . import compare as cmp
 from .symbols import SymbolMap
+
+# a name that spells its own address (``func_80012340``, ``D_800A1230``): whatever resolves it, declared
+# or taken from the retail words, must give that address, or the reference is to the wrong symbol
+ADDRESS_NAME = re.compile(r"(?:D|func|jtbl|sym|data|B|L)_([0-9A-Fa-f]{8})")
+
+SHT_PROGBITS, SHF_ALLOC = 1, 0x2
 
 
 @dataclass
@@ -76,6 +87,23 @@ def _first_diff(a: bytes, b: bytes) -> int | None:
         if x != y:
             return index
     return None if len(a) == len(b) else min(len(a), len(b))
+
+
+def loaded_sections(elf: Elf) -> list[str]:
+    """Names of the object's non-empty sections that put initialized bytes into the image
+    (``SHT_PROGBITS`` with ``SHF_ALLOC``; the flags are read from the section headers)."""
+    raw = getattr(elf, "data", b"") or b""
+    if len(raw) < 0x34:
+        return []
+    shoff, = struct.unpack_from(">I", raw, 0x20)
+    shentsize, = struct.unpack_from(">H", raw, 0x2E)
+    out = []
+    for section in elf.sections:
+        where = shoff + section.index * shentsize + 8
+        if section.type == SHT_PROGBITS and section.size and where + 4 <= len(raw) \
+                and struct.unpack_from(">I", raw, where)[0] & SHF_ALLOC:
+            out.append(section.name)
+    return out
 
 
 def strict_compare(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int, symbols: SymbolMap,
@@ -132,7 +160,8 @@ def strict_compare(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int,
     # an assumption may not contradict what is declared
     by_address: dict[int, set[str]] = {}
     for name, address in symbols.items():
-        by_address.setdefault(address, set()).add(name)
+        if name != GP_SYMBOL:                        # _gp marks an address; it names no object there
+            by_address.setdefault(address, set()).add(name)
     for item in result.assumptions:
         if item.kind != "symbol":
             continue
@@ -144,14 +173,32 @@ def strict_compare(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int,
             result.conflicts.append(f"call to {item.name} would land on 0x{item.address:08X}, which is not a "
                                     "function start")
 
+    for name in sorted({r.symbol for r in relocations if r.section is None and r.symbol}):
+        spelled = ADDRESS_NAME.fullmatch(name)
+        address = syms.resolve(name)
+        if spelled and address is not None and address != int(spelled.group(1), 16):
+            result.conflicts.append(f"{name} resolves to 0x{address:08X}, not the address its name spells: "
+                                    "wrong symbol or wrong addend")
+
     data_ok, limits = True, section_sizes or {}
-    for name in cmp.COMPARED:
+    compared = set()
+    # any other section the object loads (.ctors, .rodata.<x>, .rdata beside .rodata, ...) is
+    # reported, never silently left out of the verdict
+    extra = tuple(name for name in loaded_sections(elf)
+                   if name != text_section.name and name not in cmp.COMPARED)
+    for name in cmp.COMPARED + extra:
         section = cmp.find_section(elf, name)
-        if section is None or not section.size:
-            continue
+        if section is None or not section.size or section.name in compared:
+            continue                                 # (.sdata falls back to .data: compare it once)
+        compared.add(section.name)
         row = {"section": name, "size": section.size}
         base = have.get(section.name, have.get(name))
-        if base is None:
+        if name in extra:
+            row["status"] = "unverified"
+            result.notes.append(f"{name} ({section.size} bytes) is not a section the strict comparison "
+                                "knows: its content was not compared")
+            data_ok = False
+        elif base is None:
             row["status"] = "unverified"
             result.notes.append(f"{name} ({section.size} bytes) has no declared base and is not referenced by "
                                 ".text: its content was not compared")
@@ -181,7 +228,13 @@ def strict_compare(elf: Elf, rom: bytes, vram_to_rom, text_vram: int, size: int,
                 result.sections.append(row)
                 continue
             want = rom[offset:offset + owned]
-            if data[:owned] == want:
+            if data[:owned] == want and any(data[owned:]):
+                # past its owned size the object still holds data, not padding: those bytes would
+                # land on another unit's (as for .text, a mismatch)
+                row.update(status="different", first_diff=f"0x{owned:X}")
+                result.notes.append(f"{name}: the object continues with non-zero bytes past its owned "
+                                    f"{owned} bytes")
+            elif data[:owned] == want:
                 row["status"] = "equal"
             else:
                 first = _first_diff(data[:owned], want)

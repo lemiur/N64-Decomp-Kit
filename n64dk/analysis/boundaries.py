@@ -236,6 +236,64 @@ class Verified:
         return any(s == start and e == end for s, e, _l in self.overlapping(start, end))
 
 
+def call_stub(image: "Image", vram: int, size: int) -> tuple[int, int] | None:
+    """(bytes of the stub, address of the function after it) when the range begins with ``jal f`` and its
+    delay slot, then zero words, then code that opens a frame and saves $ra within its first instructions."""
+    words = [image.word(vram + 4 * k) for k in range(min(size // 4, 16))]
+    if len(words) < 8 or None in words or words[0] >> 26 != 3 or words[1] == 0:
+        return None
+    k = 2
+    while k < len(words) and words[k] == 0:
+        k += 1
+    if k == 2 or k >= len(words) - 2:
+        return None
+    body = words[k:k + 8]
+    frame = [i for i, w in enumerate(body) if w >> 16 == 0x27BD and w & 0x8000]
+    saves = [i for i, w in enumerate(body) if w >> 16 == 0xAFBF]
+    if not frame or not saves or saves[0] < frame[0] or any(w >> 26 in (2, 3) or w == 0x03E00008 for w in body[:saves[0]]):
+        return None
+    return 8, vram + 4 * k
+
+
+_RA_RETURN, _SP_FROM_FP = 0x03E00008, (0x03C0E821, 0x03C0E825, 0x03C0E82D)     # jr $ra; move $sp, $fp
+
+
+def unreachable_epilogue(owner_words: list[int], piece_words: list[int]) -> str | None:
+    """Why ``piece_words`` are the epilogue of the function ``owner_words`` that nothing reaches, or None.
+
+    An unoptimising compiler emits a function's epilogue even when control never gets there (the body ends
+    in an endless loop).  A catalogue cut at the last jump then lists the epilogue as a function of its own.
+    It is that epilogue, and no function, when all of this holds: the owner opens a frame and never returns;
+    the piece does nothing but restore registers from the stack, release a frame and return; the frame it
+    releases is the owner's; and every register it restores was saved at that offset by the owner."""
+    if not owner_words or owner_words[0] >> 16 != 0x27BD or not owner_words[0] & 0x8000 \
+            or _RA_RETURN in owner_words:
+        return None
+    frame = 0x10000 - (owner_words[0] & 0xFFFF)
+    saved = {(w & 0xFFFF): (w >> 16) & 31 for w in owner_words
+             if w >> 26 in (0x2B, 0x3F) and (w >> 21) & 31 == 29}         # sw/sd reg, offset($sp)
+    restored, released, returned = [], False, False
+    for w in piece_words:
+        if w == 0 or w in _SP_FROM_FP:
+            continue
+        if w >> 26 in (0x23, 0x37) and (w >> 21) & 31 == 29:              # lw/ld reg, offset($sp)
+            if saved.get(w & 0xFFFF) != (w >> 16) & 31:
+                return None
+            restored.append((w >> 16) & 31)
+        elif w >> 16 == 0x27BD and not w & 0x8000:
+            if (w & 0xFFFF) != frame or released:
+                return None
+            released = True
+        elif w == _RA_RETURN:
+            returned = True
+        else:
+            return None
+    if not (restored and released and returned):
+        return None
+    return (f"the epilogue of a function that never returns: it releases the same {frame}-byte frame and restores "
+            f"{len(restored)} register(s), each saved at that offset by the function's prologue")
+
+
 def _op(kind: str, confidence: float, evidence: list[str], remove=(), insert=(), released=(), **extra) -> dict:
     op = {"kind": kind, "confidence": round(confidence, 2), "status": "proposed",
           "remove": [_row_json(r) for r in remove], "insert": [_row_json(r) for r in insert],
@@ -336,6 +394,23 @@ def solve(image: Image, catalogue: list[Row], also: list[Image] = (), verified: 
         if not chain:
             k += 1
             continue
+        if len(chain) == 1 and chain[0].size > 8 and not _closed(owner.flow):
+            # One word that nothing executes in front of a function: the body before it is closed, nothing
+            # refers to the word, and what follows it opens a frame and is a closed body with complete entry
+            # evidence.  The word is not code (padding of another kind, a constant); the function starts after it.
+            piece = chain[0]
+            rest = image.flow(piece.vram + 4, piece.size - 4)
+            second = rest.insns[0].word if rest.insns else 0
+            if second >> 16 == 0x27BD and second & 0x8000 and not _closed(rest) \
+                    and flowmod.entry_evidence(rest)["complete"]:
+                why = ("one word in front of a function that nothing executes: the body before it is closed, nothing "
+                       "calls or points to it, and the frame is opened by the word after it")
+                ops.append(_op("shrink", 0.9, [f"{piece.name} at {hx(piece.vram)}: " + "; ".join(
+                    (piece.strong_interior or piece.start_problems)[:2]), why], [piece.row],
+                    [(name(piece.vram + 4), piece.vram + 4, piece.size - 4)], [(piece.vram, 4, "data")], certain=why))
+                consumed.add(piece.vram)
+                k = j
+                continue
         merged = image.flow(owner.vram, end - owner.vram)
         open_ = _closed(merged)
         extended = []
@@ -375,14 +450,42 @@ def solve(image: Image, catalogue: list[Row], also: list[Image] = (), verified: 
             confidence = min(confidence, 0.6)
             evidence.append("merged body still has entry problems: " + "; ".join(merged_ev["problems"][:2]))
         new = (owner.name, owner.vram, end - owner.vram)
-        ops.append(_op("merge", confidence, evidence, [owner.row, *(f.row for f in absorbed)], [new],
-                       absorbed=[f.name for f in absorbed], open=open_, closed=not open_ and merged_ev["complete"]))
+        certain = None
+        if len(absorbed) == 1 and not bridged and not open_ and merged_ev["complete"]:
+            certain = unreachable_epilogue([i.word for i in owner.flow.insns], [i.word for i in absorbed[0].flow.insns])
+        if certain is None and not open_ and merged_ev["complete"] and not weak and not extended:
+            # The first part is not a function by itself: its control runs into the parts after it (a branch
+            # into them, or off its end), nothing calls or points to those parts, each of them could not be
+            # entered as a function (it restores what it never saved, or reads what only the code before it
+            # set), and the whole is a closed body.  One function, cut where a catalogue saw a return.  Code
+            # between the parts that no row lists and nothing calls belongs to it as well.
+            alone = _closed(owner.flow)
+            targets, falls = _open_targets(owner.flow)
+            if alone and (falls or targets) and all(owner.end <= t < end for t in targets):
+                certain = ("the first part is not a closed body (its control runs into the next part), no part "
+                           "after it can be entered as a function, and the whole is a closed body")
+        if certain:
+            evidence.append(certain)
+        ops.append(_op("merge", 0.99 if certain else confidence, evidence, [owner.row, *(f.row for f in absorbed)],
+                       [new], absorbed=[f.name for f in absorbed], open=open_,
+                       closed=not open_ and merged_ev["complete"], **({"certain": certain} if certain else {})))
         consumed.update(f.vram for f in [owner, *absorbed])
         k = j
 
     # --- per-row operations
     for f in facts:
         if f.vram in consumed:
+            continue
+        stub = call_stub(image, f.vram, f.size)
+        if stub is not None:
+            first, rest = stub
+            why = ("a call and its delay slot, padding, then a body that opens a frame and saves $ra: a compiler "
+                   "never calls before it saves $ra in a function that saves it, so the call is a routine of its "
+                   "own that does not return (hand-written) and the function starts after the padding")
+            ops.append(_op("split", 0.95, [f"{f.name}: {why}"], [f.row],
+                           [(f.name, f.vram, first), (name(rest), rest, f.end - rest)],
+                           [(f.vram + first, rest - f.vram - first, "padding")], at=[hx(rest)], open=[], certain=why))
+            consumed.add(f.vram)
             continue
         # entire row is not code
         if f.noncode == "padding":
@@ -553,6 +656,14 @@ def apply(catalogue: list[Row], operations: list[dict], min_confidence: float = 
     return sorted(rows, key=lambda r: (r[1], r[0])), applied, skipped
 
 
+def apply_certain(catalogue: list[Row], operations: list[dict]):
+    """``apply`` restricted to the operations the solver marked ``certain``: the ones whose evidence leaves no
+    other reading of the bytes (see ``unreachable_epilogue`` and the stray leading word).  Returns
+    (new_catalogue, applied).  Everything else stays a proposal for a reader."""
+    rows, applied, _skipped = apply(catalogue, [op for op in operations if op.get("certain")], 0.0)
+    return rows, applied
+
+
 def invert(operations: list[dict]) -> list[dict]:
     """The exact inverse: reversed order, rows removed and inserted swapped, released bytes
     reclaimed.  Inverse operations are unconditional (confidence 1, never blocked)."""
@@ -612,6 +723,9 @@ def catalogue_format(path) -> str:
     lines = text.splitlines()
     if any(_TOML_LINE.match(l) for l in lines):
         return "toml"
+    if re.search(r"(?m)^\s*functions\s*=\s*\[\s*\]", text) or re.search(r"(?m)^\s*functions\s*=\s*\[\s*$", text) \
+            and not re.search(r"(?m)^\s*\{", text):
+        return "toml"                # a TOML function table that lists no function: an empty catalogue
     if any(_SYM_LINE.match(l) for l in lines):
         return "symbol_addrs"
     if _tsv_columns(lines[:20]):

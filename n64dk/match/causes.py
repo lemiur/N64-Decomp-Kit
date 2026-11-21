@@ -61,25 +61,30 @@ TAXONOMY = {
     "assembler.variant": "difference created by the assembler, not the compiler",
     "compiler.family": "retail code was produced by a different compiler family than the candidate pipeline",
     "relocation.target": "call or address resolves elsewhere",
+    "call.set": "the calls made differ in number or in target",
+    "control.shape": "the number of branches, returns or computed jumps differs",
+    "control.switch_map": "a jump table sends cases to different arms",
     "tu.context": "matches only inside its translation unit",
     "semantic.unknown": "instructions differ without a recognised pattern",
 }
 FAMILIES_FOR = {
     "type.signedness": ("types", "fields", "casts", "globals", "ast-cast"),
-    "type.width": ("types", "fields", "casts", "globals", "ast-cast"),
+    "type.width": ("types", "fields", "casts", "globals", "ast-cast", "hand"),
     "type.volatile": ("volatile", "globals"),
-    "global.declaration": ("globals",),
+    "global.declaration": ("globals", "hand"),
     "register.lifetime": ("lifetime", "ast-stmt-order", "scope", "split", "ast-temp", "ast-inline-temp"),
     "register.permutation": ("callargs", "ast-control", "ast-inline-temp", "ast-temp", "ast-decl-order", "order",
-                             "lifetime", "ast-stmt-order", "scope", "split", "ast-expr", "expression"),
+                             "lifetime", "ast-stmt-order", "scope", "split", "ast-expr", "expression", "hand"),
     "register.pressure": ("callargs", "ast-inline-temp", "ast-temp", "ast-control", "lifetime", "split", "scope",
-                          "ast-expr", "expression", "types"),
+                          "ast-expr", "expression", "types", "hand"),
     "schedule.delay_slot": ("volatile", "ast-stmt-order", "lifetime", "order", "ast-sameline", "ast-block",
-                            "expression"),
+                            "expression", "hand"),
     "schedule.load_hazard": ("ast-stmt-order", "ast-sameline", "ast-block"),
-    "control.branch_form": ("ast-control", "control", "ast-expr", "expression"),
+    "control.branch_form": ("ast-control", "control", "ast-expr", "expression", "hand"),
     "control.branch_likely": ("ast-control", "control", "ast-expr", "expression"),
-    "frame.size": ("ast-inline-temp", "ast-temp", "types", "split", "scope", "volatile", "ast-cast"),
+    "call.set": ("callargs", "split", "ast-inline-temp", "ast-control", "expression"),
+    "control.shape": ("ast-control", "control", "ast-block", "ast-expr", "hand"),
+    "frame.size": ("ast-inline-temp", "ast-temp", "types", "split", "scope", "volatile", "ast-cast", "hand"),
     "semantic.unknown": ("callargs", "ast-control", "ast-expr", "ast-cast", "ast-inline-temp", "types", "fields",
                          "casts", "expression", "control"),
 }
@@ -247,6 +252,39 @@ def _webs(insns) -> dict[int, list[tuple[int, int, bool, int]]]:
     return out
 
 
+def gcc_priority(refs: int, live_length: int, loop_depth: int = 0) -> float:
+    """GCC 2.7.2's allocation priority of a pseudo register (local-alloc/global): ``floor_log2(refs)
+    * refs / live_length``, where every reference counts once per enclosing loop level (``flow.c``
+    adds ``loop_depth`` per reference, outside loops 1).  Higher priority is allocated first and gets
+    the lowest free register; ties go to the lower pseudo number (the value created first)."""
+    weighted = refs * (loop_depth + 1)
+    if weighted <= 0 or live_length <= 0:
+        return 0.0
+    return (weighted.bit_length() - 1) * weighted / live_length
+
+
+def permutation_advice(forward: dict[int, set[int]], candidate_webs) -> str:
+    """For a consistent register exchange: which candidate value must gain or lose priority.  The
+    candidate's value in register b belongs in register t; a value that must move to a register
+    allocated earlier (a lower number among the same class) must outrank the value now there."""
+    notes = []
+    for built, targets in sorted(forward.items()):
+        retail = next(iter(targets))
+        if retail == built or not candidate_webs.get(built):
+            continue
+        first, last, _crosses, uses = max(candidate_webs[built], key=lambda web: web[3])
+        priority = gcc_priority(uses, last - first + 1)
+        direction = "gain" if retail < built else "lose"
+        verb = "a reference (or move it into a loop)" if direction == "gain" else \
+            "a reference (or take it out of a loop, or let its rival gain one)"
+        notes.append(f"the value in {reg_name(built)} ({uses} refs over {last - first + 1} instructions, priority "
+                     f"{priority:.2f}) belongs in {reg_name(retail)}: it must {direction} priority, i.e. "
+                     f"{'gain' if direction == 'gain' else 'lose'} {verb}")
+        if len(notes) == 2:
+            break
+    return "; ".join(notes)
+
+
 def _web_at(webs, reg: int, index: int):
     for web in webs.get(reg, []):
         if web[0] <= index <= web[1]:
@@ -281,6 +319,15 @@ def diagnose(target: bytes, candidate: bytes | None, vram: int, flow: Flow | Non
         return bag.ranked()
     if candidate.rstrip(b"\0") == target.rstrip(b"\0") and len(candidate) >= len(target):
         return []
+    from . import walls                                   # late: walls imports nothing from here
+    wall = walls.classify(target, candidate)
+    if wall["wall"] == "call-set":
+        bag.add("call.set", 0.95, "; ".join(wall["evidence"][:3]),
+                "complete the body or the inline helper that makes the missing call (or remove the extra one) "
+                "before working on registers or instruction order")
+    elif wall["wall"] == "control-flow":
+        bag.add("control.shape", 0.9, "; ".join(wall["evidence"][:3]),
+                "find the source construct that adds or removes the branch or return before working on registers")
     left, right = flow.insns, flowmod.decode(candidate, vram)
     matcher = difflib.SequenceMatcher(None, [i.op for i in left], [i.op for i in right], autojunk=False)
     mapping: Counter = Counter()
@@ -429,10 +476,13 @@ def diagnose(target: bytes, candidate: bytes | None, vram: int, flow: Flow | Non
                     "move the initialisation across the call (lifetime family)")
         elif consistent and not real_structural:
             pairs = ", ".join(f"{reg_name(b)}->{reg_name(next(iter(t)))}" for b, t in sorted(forward.items())[:6])
+            advice = permutation_advice(forward, webs_c)
             bag.add("register.permutation", 0.85, f"consistent exchange {pairs}; first at 0x{first_t.vram:08X}"
-                    + (f"; {lifetime_notes[0]}" if lifetime_notes else ""),
-                    "GCC orders call-crossing values by floor_log2(uses)*uses/length and gives the lowest free "
-                    "register first; IDO by first use: change which value is created or used first")
+                    + (f"; {lifetime_notes[0]}" if lifetime_notes else "") + (f"; {advice}" if advice else ""),
+                    "GCC 2.7.2 ranks values by floor_log2(refs)*refs/live_length (ties to the lower pseudo "
+                    "number, i.e. the one created first; refs count once per enclosing loop level, and a "
+                    "goto-built loop is no loop: write it as while (1) { ... } or the reverse) and gives the "
+                    "lowest free register first; IDO by first use: change which value is created or used first")
         else:
             bag.add("register.pressure", 0.6 if not real_structural else 0.35,
                     f"{len(register_rows)} instruction(s) differ only in registers, first at 0x{first_t.vram:08X}"
@@ -446,6 +496,18 @@ def diagnose(target: bytes, candidate: bytes | None, vram: int, flow: Flow | Non
                 "compare control flow and expressions around the first divergence")
     elif real_structural > 4:
         bag.add("semantic.unknown", 0.4, f"{real_structural} further structural difference(s)", "")
+    family = bag.items.get("compiler.family")
+    if family is not None:                                 # another compiler entirely: its differences explain the rest
+        for early in ("call.set", "control.shape"):
+            if early in bag.items:
+                bag.items[early].confidence = min(bag.items[early].confidence, family.confidence - 0.05)
+    # the routing order: a cause of a later class is a consequence while an earlier class is open
+    for held in walls.gate(wall["wall"], list(bag.items)):
+        item = bag.items[held]
+        item.confidence = min(item.confidence, 0.3)
+        note = f"held back: the {wall['wall']} difference comes first"
+        if note not in item.evidence:
+            item.evidence.append(note)
     return bag.ranked()
 
 

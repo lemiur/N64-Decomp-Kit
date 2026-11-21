@@ -179,6 +179,16 @@ class FetchTest(unittest.TestCase):
                     compilers.fetch("egcs_1.1.2-4", Path(tmp) / "root", opener=opener)
                 self.assertFalse((Path(tmp) / "outside").exists())
 
+    def test_a_pinned_manifest_is_required_and_reported(self):
+        opener, seen = self._registry()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(compilers.FetchError):
+                compilers.fetch("egcs_1.1.2-4", Path(tmp), opener=opener, pin="sha256:other")
+            self.assertFalse(any("/blobs/" in url for url in seen))        # refused before any layer
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            result = compilers.fetch("egcs_1.1.2-4", Path(tmp), opener=opener, pin="sha256:m")
+            self.assertEqual((result["status"], result["manifest_digest"]), ("fetched", "sha256:m"))
+
     def test_an_unknown_identifier_is_refused_before_any_request(self):
         with self.assertRaises(compilers.FetchError):
             compilers.fetch("not-a-compiler", Path("/nonexistent"), opener=lambda *a, **k: self.fail("requested"))

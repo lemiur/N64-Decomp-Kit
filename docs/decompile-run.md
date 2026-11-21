@@ -10,6 +10,7 @@ catalogue-to-link shifts; an unattended run should not guess a delta from their 
 The proof and acceptance details for this release are in
 [`round5-integration.md`](round5-integration.md).
 
+<!-- example: fixture=project requires=project,compiler,source id=decompile-run-donors -->
 ```sh
 n64dk --format json decompile-run --project . --all-images --out out/run \
     --donors donors.toml --max-size 0x400 --budget 100
@@ -18,13 +19,21 @@ n64dk --format json decompile-run --project . --all-images --out out/run \
 `--effort quick|normal|deep|exhaustive` chooses how much work follows this pass; the default
 `normal` is the single pass described here. Deep and exhaustive add cause-driven rounds until a
 fixed point or a budget, `--resume RUN` continues a run and `decompile-status RUN` shows its
-rounds: see [solver.md](solver.md).
+rounds: see [solver.md](solver.md).  `exhaustive` is the kitchen sink: nothing is skipped to save
+builds (the recipe gate and search economics are off) and every opt-in technique is on (region and
+unit recipe retries, regional calibration).  `decompile-everything ROM... --out DIR` runs init, an
+exhaustive run, export and status for each title.
+
+The export's `FUNCTIONS.tsv` has a `unit_class` column (`boot`, `rsp`, `handwritten`, `sdk`,
+`game`) and `COVERAGE.md` counts the classes apart: no figure combines boot code, RSP microcode,
+hand-written routines and compiled C.
 
 ## Starting from a ROM alone
 
 A title nobody has worked on has no catalogue, no symbol list and no known compiler.
 `decompile-init` derives all three from the ROM and writes a project `decompile-run` can use:
 
+<!-- example: fixture=rom requires=rom,compiler,source id=decompile-run-rom-alone -->
 ```sh
 n64dk decompile-init game.z64 --out work/game
 n64dk decompile-run --project work/game --all-images --out work/game/run --allow-project-output \
@@ -179,6 +188,33 @@ unknown-toolchain classifier enough to suppress variant search; without that swi
 classification is advisory. These switches remain available for controlled experiments, but a
 normal unattended run does not spend work or discard search based on those weak measurements.
 
+## Small data: `-G`, `$gp` and GP-relative relocations
+
+Code built with a nonzero `-G` keeps small globals (`.sdata`, `.sbss`) and float literals
+(`.lit4`, `.lit8`) within 32 KiB of `_gp` and addresses them as `offset($gp)`.  Such code cannot
+match without the program's `_gp`, and its objects carry `R_MIPS_GPREL16` and
+`R_MIPS_LITERAL` relocations.
+
+* **Stage 0b** (`--small-data auto`, the default) recovers `_gp` from the program's own code: every
+  `lui $gp` / `addiu $gp` (or `ori`) pair in catalogued functions forms a value; all setting sites
+  must agree, the value must be nonzero, and the evidence must be strong (two or more sites, or one
+  site and at least 16 GP-relative uses).  Otherwise nothing is declared.  The value is written to
+  `small_data/gp_symbols.txt` in the run directory and declared to the resolver; a project that
+  declares `_gp` itself keeps its value.  The report's `small_data` entry says what was found.
+* **Relocation.**  GP-relative fields are relocated against the declared `_gp`
+  (`A + S + GP0 - GP` for a local symbol, `A + S - GP` for an external one, with the object's
+  `.reginfo` GP0).  A value outside the signed 16-bit range is an error, never truncated, and
+  without `_gp` the object does not relocate at all.  `.sdata`, `.lit4` and `.lit8` are compared
+  byte for byte like `.rodata` and `.data`; sections and symbols inferred through `_gp` from the
+  retail code are assumptions, as with `%hi`/`%lo`.
+* **Lanes.**  The established lanes still assemble at `-G0`.  The small-data lanes give the
+  assembler the compiler's `-G`: `kmc+asg` (KMC `as` 2.6: `.comm` symbols and float literals
+  through `$gp`) and `kmc+gas` (period GNU `as` 2.9.x, `[toolchains] gas29` or found under the
+  toolchain root: also symbols the compiler declares `.extern name, size`).  They are offered only
+  when `_gp` is declared and the function's own code addresses through `$gp`.
+* **Drafts** name GP-relative accesses `%gp_rel(sym)($gp)`, so the decompiler sees the global.
+* `--small-data off` skips all of it.
+
 ## A set of titles: `decompile-batch`
 
 ```sh
@@ -319,6 +355,15 @@ and of the SDK are tried before units of the library, so a library that grows wi
 does not push them out.  (With four attempts and no order between the kinds, a title visited a
 second time, after the library had grown, lost nine functions it had the first time.)
 
+A place is a unit start *and* the size compared.  Units of different sizes that begin at one
+address are tried separately, and of the rows that overlap the largest exact one is kept: an
+empty function at the head of a unit is also some donor's 4-byte unit, and it must not stand in
+for the unit that begins there.  A unit of several functions is also built when some of its
+functions differ from the donor's only in `%lo` halves the masking missed; the strict comparison
+decides.  Every catalogued function that lies wholly inside a verified unit's compared bytes is
+recovered by it, whether or not it matched a donor function by itself (a blind catalogue cuts
+functions short and lists their `jr ra; nop` tails apart).
+
 ## Donor units that await symbols
 
 A donor unit can be byte-identical and still rest on an address nothing independent confirms.
@@ -326,16 +371,39 @@ Three cases are settled by evidence the address derivation never looked at:
 
 - a **section of the unit itself** (`.rodata`, `.data`) whose compiled contents, at least eight
   bytes and not just zeros, are found in the image at the derived address;
-- a **function** the unit calls that was itself found, identical, at that address;
+- a **function** the unit calls that was itself found, identical, at that address and nowhere
+  else: as a function hit, as a function of a unit found whole (its whole masked code stands
+  there), or as a function of a unit already verified exact (the units still waiting are then
+  compared again, for as long as that settles something). This holds also when the unit is the
+  only one that calls it;
 - a **fixed address** (low memory below `0x80000400`, the hardware registers) that is the same
   in the donor.
 
-What is left (a `.bss` section, a data symbol no other unit placed) ends
+A fourth is settled by the units around it: **sections lying end to end**.  Each unit's `.data`
+or `.bss` address is read from that unit's own code; that the sections of several units abut at
+the sizes and alignments they were compiled with is something no single reading implies.  For
+`.data` the rule is the one read-only data already had (at least two pieces, 16 bytes and 8
+non-zero bytes over the chain, every piece's contents equal to the image, zero bytes between
+pieces).  `.bss` holds no bytes, so the abutting addresses are all the evidence: at least two
+pieces and 16 bytes, and only in the order of the units' code, as a linker lays them out.  A unit
+in an accepted chain is compared again with that base given and is exact only if the strict
+comparison is, with nothing left assumed.  Such a base has the pin origin `section-chain`
+(apart from `section-content`), the report lists the chains and the units resting on them
+(`section_chains`), and `verify-run` builds every unit the run lists and computes the chains
+again: a unit whose section is in none of them fails its replay.
+
+What is left (a `.bss` section nothing abuts, a data symbol no other unit placed) ends
 `identical-awaiting-symbols`: the functions are not attempted again, are counted with the
 `assumed` cases, and `<image>/donors/awaiting_symbols.txt` lists the declarations that would
 settle them. Code that is identical at several addresses with a different symbol each time (a
 getter, a setter), or whose fixed-address symbol is a different address in the target, is the
 shape of a function and not the donor's function; it goes to the resolve stage as before.
+
+A target function that is, masked, several functions of one donor at once (two getters, one
+routine written for two devices) does not vote for an address at the sites where those functions
+refer to different things: at most one reading is right, and the wrong ones used to contradict
+the functions that really use those symbols.  `<image>/donors/hits.json` lists every hit with
+its status, the start its unit would have and the notes.
 
 ## Hand-written code
 

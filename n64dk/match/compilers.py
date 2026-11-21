@@ -81,10 +81,15 @@ def find(root: Path | None, compiler: Compiler) -> Path | None:
 def status(root: Path | None) -> dict:
     """What a toolchain root covers: per compiler whether it is installed and whether the kit
     can drive it, and the totals a run report should state."""
+    import shutil
+    host_gcc = shutil.which("gcc") is not None
     rows = []
     for compiler in CATALOGUE:
         path = find(root, compiler)
         lane, why = lane_status(root, compiler)
+        if lane and compiler.family == "sn" and not host_gcc:
+            # every SN lane preprocesses with the host gcc (``gcc -E``); without it each build fails
+            lane, why = None, "the host C preprocessor (gcc) is not installed: install gcc (apt install gcc)"
         rows.append({"id": compiler.ident, "name": compiler.name, "family": compiler.family,
                      "installed": path is not None, "directory": str(path) if path else None,
                      "lane": lane, "no_lane_because": why, "usable": path is not None and lane is not None,
@@ -292,9 +297,13 @@ def _safe_members(archive, root: Path):
         yield member
 
 
-def fetch(ident: str, root: Path, force: bool = False, opener=_get) -> dict:
+def fetch(ident: str, root: Path, force: bool = False, opener=_get, pin: str | None = None) -> dict:
     """Download one compiler of the catalogue into ``root/<directory>``.  Returns what happened;
-    raises ``FetchError`` on a failure that leaves nothing installed."""
+    raises ``FetchError`` on a failure that leaves nothing installed.
+
+    ``pin`` (``sha256:...``) is the image manifest digest a reviewer accepted: when given, any other
+    manifest is refused before a layer is downloaded, so "latest" cannot drift silently.  The
+    result always carries ``manifest_digest``, the value to pin.  Nothing fetched is executed."""
     import hashlib
     import json
     import shutil
@@ -321,6 +330,8 @@ def fetch(ident: str, root: Path, force: bool = False, opener=_get) -> dict:
                           if m.get("mediaType") == "application/vnd.oci.image.manifest.v1+json"), None)
             if entry is None:
                 raise FetchError("the image index lists no image manifest")
+            if pin and entry.get("digest") != pin:
+                raise FetchError(f"{ident}: the registry's manifest {entry.get('digest')} is not the pinned {pin}")
             with opener(f"{base}/manifests/{entry['digest']}", {**auth, "Accept": entry["mediaType"]}) as reply:
                 manifest = json.load(reply)
         except FetchError:
@@ -360,5 +371,70 @@ def fetch(ident: str, root: Path, force: bool = False, opener=_get) -> dict:
             shutil.move(str(inner), str(destination))
         missing = [name for name in compiler.required if not (destination / name).exists()]
         return {"id": ident, "status": "fetched", "directory": str(destination), "bytes": size, "image": image,
-                "missing_expected_files": missing}
+                "manifest_digest": entry.get("digest"), "missing_expected_files": missing}
     raise FetchError(f"{ident}: not found in the registry ({last})")
+
+
+# ---------------------------------------------------------------------------------------------
+# Sibling versions.  A title is not built by one compiler version: its libraries were built when
+# and where their vendors built them (Sesame Street: the speech library with IDO 7.1, the game
+# with IDO 5.3).  Most small functions come out the same under both versions and say nothing
+# about which one built them; the few that differ are near misses under the wrong one (same
+# size, a handful of instructions).  So a near miss is tried under the sibling versions of its
+# compiler before its source is permuted, and only functions that match under one version and
+# not the other count as evidence for a version.
+
+SIBLINGS: tuple[frozenset[str], ...] = (frozenset({"ido5.3", "ido7.1"}), frozenset({"kmc+as", "kmc+asn64"}))
+
+
+def siblings(pipeline: str) -> tuple[str, ...]:
+    """The other versions/lanes of the same compiler (ido5.3 <-> ido7.1, kmc+as <-> kmc+asn64)."""
+    for group in SIBLINGS:
+        if pipeline in group:
+            return tuple(sorted(group - {pipeline}))
+    return ()
+
+
+def _level(flags) -> str | None:
+    return next((f for f in flags if f.startswith("-O") or f == "-g"), None)
+
+
+def sibling_recipe(current: str, label: str, levels=()) -> bool:
+    """Whether recipe ``label`` ("pipeline flags") is a sibling of ``current``: a sibling version
+    with the same flags, or the same/sibling compiler at an optimisation level of ``levels`` (the
+    levels the region already uses) with the flags otherwise unchanged."""
+    pipeline, _, flags = current.partition(" ")
+    other, _, other_flags = label.partition(" ")
+    if label == current or (other != pipeline and other not in siblings(pipeline)):
+        return False
+    a, b = flags.split(), other_flags.split()
+    if a == b:
+        return other != pipeline
+    rest_a = [f for f in a if f != _level(a)]
+    rest_b = [f for f in b if f != _level(b)]
+    return rest_a == rest_b and _level(b) in set(levels)
+
+
+def version_evidence(cases) -> dict:
+    """Which version a set of matched functions supports.  ``cases``: ``(recipe label, labels the
+    same source is exact under, or None when that was not checked)``.  A function exact under
+    several sibling versions supports none of them (``insensitive``); a function checked and exact
+    under one version only is ``discriminating``; an unchecked one still votes (``unchecked``).
+    Returns ``{"votes": {label: n}, "insensitive": n, "discriminating": n, "unchecked": n}``."""
+    votes: dict[str, int] = {}
+    insensitive = discriminating = unchecked = 0
+    for label, exact_under in cases:
+        if exact_under is None:
+            unchecked += 1
+            votes[label] = votes.get(label, 0) + 1
+            continue
+        under = set(exact_under or ()) | {label}
+        pipeline = label.partition(" ")[0]
+        flags = label.partition(" ")[2]
+        versions = {u.partition(" ")[0] for u in under if u.partition(" ")[2] == flags}
+        if versions & set(siblings(pipeline)):
+            insensitive += 1
+            continue
+        discriminating += 1
+        votes[label] = votes.get(label, 0) + 1
+    return {"votes": votes, "insensitive": insensitive, "discriminating": discriminating, "unchecked": unchecked}

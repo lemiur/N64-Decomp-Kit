@@ -201,6 +201,15 @@ def _setup(args):
     target = Target.from_rom(image, selected_delta)
     sym_files = [Path(s) for s in args.symbols] or cfg.symbols or symmod.discover(cfg.project)
     syms = symmod.load(sym_files)
+    # real names (sin, cos, ...) must resolve to one address and agree with the code's identity
+    # where an SDK signature named it (NAMES.tsv beside the project): a swapped pair is refused,
+    # because a relocated compare cannot tell two same-shaped library functions apart
+    names_tsv = Path(cfg.project) / "NAMES.tsv"
+    identities = symmod.identities_from_names(names_tsv.read_text()) if names_tsv.is_file() else {}
+    try:
+        args._name_findings = symmod.require_consistent_names(syms, identities)
+    except symmod.NameError_ as error:
+        raise symmod.NameError_(f"symbol names: {error}") from None
     resolved = getattr(args, "_resolved_mapping", None)
     row = getattr(args, "_resolved_inventory_row", None)
     if resolved and row and resolved.get("linked_base"):
@@ -948,6 +957,8 @@ def _permute_args(p):
     p.add_argument("--seed", type=int)
     p.add_argument("--max-mutations", type=int, default=3)
     p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument("--islands", type=int, default=1, help="independent walkers from the same start (default 1)")
+    p.add_argument("--keep", type=int, default=4, help="best results kept that compile to different code")
     p.add_argument("--out", help="directory for best.c")
     p.add_argument("--replay-log", help="append every generated candidate and oracle score as JSONL")
     p.add_argument("--proposal-log", help="generate uncompiled candidates here and exit")
@@ -974,7 +985,8 @@ def match_permute(args):
     res = permuter.permute(Path(args.source).resolve(), spec, cfg, target, comparison_addr, args.size, syms,
                            cfg.include, args.function, args.iterations, args.jobs or 4, args.seed,
                            args.max_mutations, args.temperature, Path(args.out) if args.out else None,
-                           Path(args.replay_log) if args.replay_log else None)
+                           Path(args.replay_log) if args.replay_log else None,
+                           islands=args.islands, keep=args.keep)
     strict = None
     if res.exact:
         with tempfile.TemporaryDirectory(prefix="n64dk-permute-verify-") as name:
@@ -985,6 +997,8 @@ def match_permute(args):
             "exploratory_exact": res.exact, "exact": bool(strict and strict.exact),
             "strict_verification": strict.as_dict() if strict else None,
             "iterations": res.iterations, "improvements": res.history,
+            "frontier": [{"score": score, "output": state[:16], **({"source": text} if args.format == "json" else {})}
+                         for score, state, text in res.frontier],
             **({"best_source": res.best_source} if args.format == "json" else {})}
 
 

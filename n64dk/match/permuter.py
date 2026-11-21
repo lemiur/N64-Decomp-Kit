@@ -347,6 +347,9 @@ class PermuteResult:
     iterations: int
     exact: bool
     history: list[tuple[int, int]] = field(default_factory=list)  # (iteration, score)
+    # the best few results that differ in what they compile to (score, output digest, source): two sources
+    # that compile to the same code are one state, however different they read
+    frontier: list[tuple[int, str, str]] = field(default_factory=list)
 
 
 def generate_pool(source: Path, symbols: symmod.SymbolMap, includes: list[Path],
@@ -416,7 +419,7 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
             symbols: symmod.SymbolMap, includes: list[Path], function: str | None = None,
             iterations: int = 200, jobs: int = 4, seed: int | None = None, max_mutations: int = 3,
             temperature: float = 0.1, out_dir: Path | None = None,
-            replay_log: Path | None = None) -> PermuteResult:
+            replay_log: Path | None = None, islands: int = 1, keep: int = 4) -> PermuteResult:
     from pycparser import c_ast, c_generator, c_parser
     prep = prepare(source, symbols, includes, function, vram)
     syms = symbols.copy()
@@ -425,12 +428,25 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
     gen = c_generator.CGenerator()
     rng = random.Random(seed)
     seen: dict[str, int] = {}
+    outputs: dict[str, str] = {}                # source digest -> digest of what it compiled to
+    frontier: dict[str, tuple[int, str]] = {}   # output digest -> (score, source)
 
     def find(tree):
         for ext in tree.ext:
             if isinstance(ext, c_ast.FuncDef) and ext.decl.name == prep.function:
                 return ext
         raise RuntimeError(f"function {prep.function} not found")
+
+    def note(text: str, value: int) -> None:
+        """Keep ``text`` if it is one of the ``keep`` best states that compile to different code."""
+        if value >= 1 << 30:
+            return
+        state = outputs.get(hashlib.sha1(text.encode()).hexdigest()) or "source:" + hashlib.sha1(text.encode()).hexdigest()
+        held = frontier.get(state)
+        if held is None or value < held[0]:
+            frontier[state] = (value, text)
+        if len(frontier) > max(1, keep):
+            del frontier[max(frontier, key=lambda key: frontier[key][0])]
 
     with tempfile.TemporaryDirectory(prefix="n64dk-permute-") as tmp:
         work = Path(tmp)
@@ -450,6 +466,8 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
             else:
                 val = max(1, o.result.diff.score if o.result.diff else 1)
             seen[key] = val
+            if o.digest:
+                outputs[key] = o.digest
             path.unlink(missing_ok=True)
             return val
 
@@ -457,6 +475,10 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
         base_score = best_score = current_score = score(base_text)
         best_text, current = base_text, ast
         history = [(0, base_score)]
+        note(base_text, base_score)
+        # islands: independent walkers from the same start, so one early lucky step does not decide the whole search
+        walkers = [[ast, base_score] for _ in range(max(1, islands))]
+        turn = 0
         if replay_log is not None:
             replay_log.parent.mkdir(parents=True, exist_ok=True)
             replay_log.write_text(json.dumps({
@@ -472,6 +494,8 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
             header = "".join(f"/* LDSYM {k}=0x{v:08X} */\n"
                              for k, v in sorted(prep.symbols.items()))
             (out_dir / "best.c").write_text(header + best_text)
+            for rank, (state, (value, text)) in enumerate(sorted(frontier.items(), key=lambda item: item[1][0]), 1):
+                (out_dir / f"frontier_{rank}.c").write_text(f"/* score {value}; output {state[:16]} */\n" + header + text)
             (out_dir / "progress.tsv").write_text(
                 "iteration\tscore\n" + "".join(f"{iteration}\t{value}\n"
                                                   for iteration, value in history))
@@ -480,6 +504,9 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
         with ThreadPoolExecutor(jobs) as pool:
             while it < iterations and best_score > 0:
                 cands = []
+                walker = walkers[turn % len(walkers)]
+                turn += 1
+                current, current_score = walker
                 for _ in range(min(jobs, iterations - it)):
                     tree = copy.deepcopy(current)
                     fn = find(tree)
@@ -504,12 +531,15 @@ def permute(source: Path, spec: BuildSpec, cfg: Config, target: Target, vram: in
                                 "iteration": it, "seed": seed,
                             }, sort_keys=True) + "\n")
                 for (tree, text, _mutations_used), sc in zip(cands, scores):
+                    note(text, sc)
                     if sc < current_score or (sc == current_score and rng.random() < temperature):
                         current, current_score = tree, sc
                     if sc < best_score:
                         best_score, best_text = sc, text
                         history.append((it, sc))
                         checkpoint()
+                walker[0], walker[1] = current, current_score
     if out_dir is not None:
         checkpoint()
-    return PermuteResult(base_score, best_score, best_text, it, best_score == 0, history)
+    ranked = sorted(((value, state, text) for state, (value, text) in frontier.items()), key=lambda item: item[0])
+    return PermuteResult(base_score, best_score, best_text, it, best_score == 0, history, ranked)

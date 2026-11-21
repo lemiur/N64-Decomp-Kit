@@ -234,7 +234,13 @@ A plain re-run without `--resume` starts a new session, as `decompile-run` alway
 - the stops;
 - the credit categories;
 - the remaining queue grouped by primary cause, with the next action or the stop reason, and
-  example functions.
+  example functions;
+- when the run has a `report.json` (written when an invocation finishes, so it describes the last
+  finished one): the discovery verdict and its denominator warning, the `small_data` entry (`_gp`
+  value, confidence, reason, the project's own `_gp` and any disagreement) and per-image totals
+  (functions, resolution outcomes, exact bytes, strict queue, ledger byte classes, coverage).
+  `--format json` adds the keys `report`, `discovery`, `small_data` and `image_totals` (null or
+  empty without a report); the earlier keys are unchanged.
 
 It opens the case store with `CaseStore(readonly=True)`: immutable when no write-ahead log is
 present, `mode=ro` otherwise. It never writes. A test checks that no file, including `-wal` and

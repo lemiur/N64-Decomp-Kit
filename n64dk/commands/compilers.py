@@ -20,7 +20,8 @@ def compilers(args):
         wanted = args.fetch or [row["id"] for row in catalogue.status(root)["compilers"] if not row["installed"]]
         for ident in wanted:
             try:
-                fetched.append(catalogue.fetch(ident, root, force=args.force))
+                pin = dict(item.split("=", 1) for item in (getattr(args, "pin", None) or []) if "=" in item).get(ident)
+                fetched.append(catalogue.fetch(ident, root, force=args.force, pin=pin))
             except catalogue.FetchError as error:
                 fetched.append({"id": ident, "status": "failed", "error": str(error)[-300:]})
             except Exception as error:                       # network trouble is a result, not a crash
@@ -37,6 +38,9 @@ def _args(p):
                    help="download these compilers (no ID: every missing one) from the public decomp.me compiler "
                         "archive into the toolchain root; each layer is checked against its SHA-256 before unpacking")
     p.add_argument("--force", action="store_true", help="with --fetch: replace a compiler that is already installed")
+    p.add_argument("--pin", action="append", metavar="ID=sha256:DIGEST",
+                   help="with --fetch: accept only this image manifest digest for ID (repeatable); a fetch "
+                        "reports the manifest_digest to pin")
 
 
 compilers.arguments = _args

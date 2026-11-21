@@ -77,6 +77,9 @@ class Policy:
     cascade: tuple[str, ...]         # after each round: declare, neighbours, recipes
     recipe_sweep: int                # alternative recipes in the recipe-sweep technique
     require_reasons: bool            # every function not attempted must carry a specific recorded reason
+    # kitchen sink (round 12): everything implemented that skips work is off, everything opt-in on
+    regional_calibration: bool = False   # calibrate each toolchain region on its own
+    recipe_gate: bool = True             # skip unoptimised recipes without evidence (saves builds)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -94,16 +97,45 @@ MODES: dict[str, Policy] = {
                    unit_recipes=False, search_economics=False, refine=True, max_rounds=4, schedule="order",
                    techniques=_LATER, cascade=("declare", "neighbours", "recipes"), recipe_sweep=16,
                    require_reasons=False),
+    # exhaustive is the kitchen sink: every implemented technique, nothing skipped to save builds
+    # (the recipe gate and search economics off, region and unit recipe retries and regional
+    # calibration on); the discovery repair and small-data stages are on in every mode
     "exhaustive": Policy("exhaustive", budget=400, max_size=0, search_ceiling=None, cross_recipes=12,
-                         region_recipes=True, unit_recipes=False, search_economics=False, refine=True, max_rounds=8,
+                         region_recipes=True, unit_recipes=True, search_economics=False, refine=True, max_rounds=8,
                          schedule="order", techniques=_LATER + ("draft-options",),
-                         cascade=("declare", "neighbours", "recipes"), recipe_sweep=24, require_reasons=True),
+                         cascade=("declare", "neighbours", "recipes"), recipe_sweep=24, require_reasons=True,
+                         regional_calibration=True, recipe_gate=False),
 }
 DEFAULT_MODE = "normal"
 # decompile-run's option defaults before effort modes existed; ``normal`` must equal them
 LEGACY_DEFAULTS = {"budget": 200, "max_size": 0, "search_ceiling": None, "cross_recipes": None,
                    "region_recipes": False, "unit_recipes": False, "search_economics": False}
 OPTION_FIELDS = tuple(LEGACY_DEFAULTS)
+# options a project's ``[run]`` table may also set.  One rule for both: an explicit command-line
+# option, else the project's setting, else the mode.  apply_policy cannot fill them into ``args`` as
+# it does OPTION_FIELDS (a filled option would hide the project's setting), so it records the mode's
+# values in ``args.mode_settings``.  That is saved with the invocation and restored on --resume: the
+# rounds a resumed run still has to do keep the values the run was started with, whatever --effort
+# the resume names.
+SETTING_FIELDS = ("recipe_gate", "regional_calibration")
+
+
+def mode_settings(mode: Policy) -> dict:
+    return {key: getattr(mode, key) for key in SETTING_FIELDS}
+
+
+def setting(args, settings: dict, key: str, mode: Policy) -> bool:
+    """The effective value of a SETTING_FIELDS option: the command line (None: not given), else the
+    project's ``[run]`` setting, else the mode values the run recorded, else ``mode``."""
+    value = getattr(args, key, None)
+    if value is not None:
+        return bool(value)
+    if settings.get(key) is not None:
+        return bool(settings[key])
+    recorded = getattr(args, "mode_settings", None)
+    if isinstance(recorded, dict) and recorded.get(key) is not None:
+        return bool(recorded[key])
+    return bool(getattr(mode, key))
 
 
 def policy(name: str | None) -> Policy:
@@ -144,6 +176,13 @@ def apply_policy(args, mode: Policy) -> dict:
     if getattr(args, "schedule", None) is None:
         args.schedule = mode.schedule
         filled["schedule"] = mode.schedule
+    # the mode's SETTING_FIELDS values, recorded once (a resumed run has restored its own already)
+    recorded = getattr(args, "mode_settings", None)
+    recorded = dict(recorded) if isinstance(recorded, dict) else {}
+    missing = {key: value for key, value in mode_settings(mode).items() if key not in recorded}
+    if missing:
+        args.mode_settings = {**recorded, **missing}
+        filled["mode_settings"] = missing
     return filled
 
 
@@ -152,7 +191,7 @@ def stage_plan(mode: Policy, args, settings: dict) -> list[str]:
     sample is configured or the code's own marks doubt the configured recipe.  ``rounds`` (later
     rounds of the fixed-point loop) appears only when more than one round is allowed; the solver's
     read-only outputs (coverage, dossiers) are not stages: they build nothing."""
-    skip = set(getattr(args, "skip_stage", None) or ())
+    skip = set(getattr(args, "skip_stage", None) or ()) | set(getattr(args, "disabled", None) or ())
     plan = []
     if "boundaries" not in skip:
         plan.append("boundaries")
@@ -160,7 +199,7 @@ def stage_plan(mode: Policy, args, settings: dict) -> list[str]:
         plan.append("donors")
     if "resolve" not in skip:
         plan += ["calibrate", "resolve"]
-        if getattr(args, "declare_assumed", None) or settings.get("declare_assumed"):
+        if (getattr(args, "declare_assumed", None) or settings.get("declare_assumed")) and "declare" not in skip:
             plan.append("declare")
         rounds = getattr(args, "rounds", None)
         if (rounds if rounds is not None else mode.max_rounds) > 1:
@@ -208,15 +247,14 @@ CAUSES: dict[str, tuple[str, tuple[str, ...]]] = {
                               ("declare", "search")),
     "large far-off": ("far from the target (above the search ceiling) or larger than 0x400",
                       ("recipe-sweep", "refine")),
-    "unknown toolchain": ("in a stretch no available compiler explains", ()),
+    "unknown toolchain": ("in a stretch whose code idioms match no compiler in the idiom table (a style fingerprint, "
+                          "not a build test)", ("recipe-sweep", "search", "refine")),
     "handwritten": ("hand-written code", ()),
 }
 STOP = {
     "no discovered image": "no image holds this code: the survey has to place it first",
     "uncertain boundary": "the range is not one whole function; boundary operations are proposed for review and "
                           "never applied unattended",
-    "unknown toolchain": "no available compiler explains this stretch; identifying an unknown compiler does not "
-                         "reproduce it",
     "handwritten": "hand-written code: kept as assembly when it reassembles, never credited as C",
 }
 
@@ -642,8 +680,17 @@ class RoundsLog:
 
     def append(self, record: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        torn = False                          # a torn last line (power loss, full disk) must not
+        try:                                  # swallow this record (CHAOS_TESTING.md finding C4)
+            with self.path.open("rb") as existing:
+                existing.seek(0, os.SEEK_END)
+                if existing.tell():
+                    existing.seek(-1, os.SEEK_END)
+                    torn = existing.read(1) != b"\n"
+        except FileNotFoundError:
+            pass
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, default=str, sort_keys=True) + "\n")
+            handle.write(("\n" if torn else "") + json.dumps(record, default=str, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 

@@ -544,6 +544,12 @@ def register_child(pid: int) -> None:
         _CHILDREN.add(pid)
 
 
+def unregister_child(pid: int) -> None:
+    """A forked worker that has been reaped: its pid may be reused, so it is no longer signalled."""
+    with _REGISTRY_LOCK:
+        _CHILDREN.discard(pid)
+
+
 def forked() -> None:
     """Call first thing in a forked worker: the parent's registrations are not its own, and the
     worker stops (SIGTERM: its tools' groups killed, see ``_terminate``) when its parent dies."""

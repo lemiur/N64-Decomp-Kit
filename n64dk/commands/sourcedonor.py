@@ -62,7 +62,8 @@ MIN_SHARED = 8             # target functions a tree must give before it is take
 def import_tree(source: Path, project: Path, out: Path, recipes: list[str], toolchain: str | None = None,
                 name: str | None = None, jobs: int = 4, defines: list[str] | None = None,
                 max_macros: int = 48, keep_work: bool = False, emit=None, by_function: bool = True,
-                prepare_command: str | None = None, whole_units_too: bool = False) -> dict:
+                prepare_command: str | None = None, whole_units_too: bool = False,
+                min_shared: int | None = None) -> dict:
     """Describe ``source`` as a donor of the title surveyed in ``project``.  Writes
     ``out/donors.toml`` when the tree gives the title anything and returns the measurements.
 
@@ -107,10 +108,13 @@ def import_tree(source: Path, project: Path, out: Path, recipes: list[str], tool
                   macros_not_measured=plan["macros_not_measured"][:40])
     donors = out / "donors.toml"
     donors.unlink(missing_ok=True)
-    if max(plan["found_by_recipe"].values(), default=0) < MIN_SHARED:
+    # A small tree (a compiler's runtime routines, three functions) is a donor too when the caller says how
+    # few are enough; the default guards the calibration of a large tree against a recipe found by chance.
+    needed = MIN_SHARED if min_shared is None else max(1, min_shared)
+    if max(plan["found_by_recipe"].values(), default=0) < needed:
         shutil.rmtree(out / name, ignore_errors=True)
         return {**report, "donors": None,
-                "reason": f"fewer than {MIN_SHARED} functions of the title are found in this tree under any candidate recipe"}
+                "reason": f"fewer than {needed} functions of the title are found in this tree under any candidate recipe"}
     result = sourcedonor.build(tree, plan, out, name, cfg, signatures, by_function=by_function)
     if whole_units_too and by_function:
         # the tree's own units as a second donor: a function that matches only when its unit is
@@ -176,7 +180,8 @@ def _source_donor(args):
     return import_tree(source, Path(args.project), Path(args.out), recipes, toolchain=args.toolchain_dir,
                        name=args.name, jobs=args.jobs, defines=args.define, max_macros=args.max_macros,
                        keep_work=args.keep_work, emit=emit, by_function=args.units != "whole" and not args.whole_units,
-                       prepare_command=args.prepare_command, whole_units_too=args.units == "both")
+                       prepare_command=args.prepare_command, whole_units_too=args.units == "both",
+                       min_shared=getattr(args, "min_shared", None))
 
 
 def _args(p):
@@ -191,6 +196,9 @@ def _args(p):
                    help="a configuration macro to set without measuring it (repeatable)")
     p.add_argument("--max-macros", type=int, default=48, help="configuration macros measured, most used first")
     p.add_argument("--name", help="donor name (default: from the directory)")
+    p.add_argument("--min-shared", type=int, default=None, metavar="N",
+                   help=f"functions of the title the tree must give to be taken as a donor (default {MIN_SHARED}); "
+                        "lower it for a small tree whose recipe you state with --recipe")
     p.add_argument("--units", choices=["split", "whole", "both"], default="split",
                    help="donor units: one per function (split, the default), the tree's own units (whole), or both "
                         "as two donors (a function is then taken from whichever verifies)")

@@ -163,6 +163,91 @@ class SolverTest(unittest.TestCase):
         self.assertNotIn("merge", kinds(called))
 
 
+FP = 30
+MOVE_FP_SP, MOVE_SP_FP = addu(FP, SP, ZERO), addu(SP, FP, ZERO)
+
+
+def j(target):
+    return (2 << 26) | ((target >> 2) & 0x03FFFFFF)
+
+
+class CertainCorrectionTest(unittest.TestCase):
+    """The two corrections decompile-run applies to its own catalogue (measured on an unoptimised title)."""
+    # a function that ends in an endless loop; the compiler still emitted its epilogue after the loop
+    LOOPS = [addiu(SP, SP, -0x18), sw(RA, 0x14), sw(FP, 0x10), MOVE_FP_SP, jal(BASE + 0x100), NOP,
+             j(BASE + 0x18), NOP]
+    EPILOGUE = [MOVE_SP_FP, lw(RA, 0x14), lw(FP, 0x10), addiu(SP, SP, 0x18), JR_RA, NOP]
+    CALLEE = [JR_RA, NOP]
+    CALLER = [addiu(SP, SP, -0x18), sw(RA, 0x14), jal(BASE), NOP, lw(RA, 0x14), JR_RA, addiu(SP, SP, 0x18)]
+
+    def solve(self, epilogue, loops=None):
+        loops = loops or self.LOOPS
+        layout = {BASE: loops, BASE + 0x20: epilogue, BASE + 0x100: self.CALLEE, BASE + 0x200: self.CALLER}
+        rows = [("func_L", BASE, 0x20), ("func_T", BASE + 0x20, 4 * len(epilogue)), ("func_C", BASE + 0x100, 8),
+                ("func_R", BASE + 0x200, 0x1C)]
+        return rows, b.solve(image(layout), rows)
+
+    def test_the_unreachable_epilogue_of_an_endless_function_is_merged_into_it(self):
+        rows, ops = self.solve(self.EPILOGUE)
+        merge = [op for op in ops if op["kind"] == "merge"][0]
+        self.assertIn("never returns", merge["certain"])
+        self.assertEqual(merge["confidence"], 0.99)
+        new, applied = b.apply_certain(rows, ops)
+        self.assertEqual(len(applied), 1)
+        self.assertIn(("func_L", BASE, 0x38), new)
+        self.assertNotIn(("func_T", BASE + 0x20, 0x18), new)
+
+    def test_another_frame_or_a_register_the_function_never_saved_is_not_certain(self):
+        for epilogue in ([MOVE_SP_FP, lw(RA, 0x14), lw(FP, 0x10), addiu(SP, SP, 0x20), JR_RA, NOP],     # other frame
+                         [MOVE_SP_FP, lw(RA, 0x14), lw(S0, 0x0C), addiu(SP, SP, 0x18), JR_RA, NOP],     # $s0 not saved
+                         [MOVE_SP_FP, lw(RA, 0x14), addu(V0, ZERO, ZERO), addiu(SP, SP, 0x18), JR_RA, NOP]):  # work
+            rows, ops = self.solve(epilogue)
+            self.assertEqual(b.apply_certain(rows, ops)[1], [], epilogue)
+
+    def test_a_function_that_returns_does_not_take_a_following_epilogue(self):
+        returns = [addiu(SP, SP, -0x18), sw(RA, 0x14), sw(FP, 0x10), MOVE_FP_SP, lw(RA, 0x14), lw(FP, 0x10),
+                   JR_RA, addiu(SP, SP, 0x18)]
+        self.assertIsNone(b.unreachable_epilogue(returns, self.EPILOGUE))
+        self.assertIsNotNone(b.unreachable_epilogue(self.LOOPS, self.EPILOGUE))
+
+    def test_a_function_cut_at_an_inner_return_is_joined_when_only_the_whole_is_closed(self):
+        ops = b.solve(image(LAYOUT), CATALOGUE)
+        merge = [op for op in ops if op["kind"] == "merge"][0]
+        # func_A branches into func_B2 and falls into func_B1; neither B part can be entered; the whole closes
+        self.assertIn("not a closed body", merge.get("certain", ""))
+        new, applied = b.apply_certain(CATALOGUE, ops)
+        self.assertIn(("func_A", BASE, 0x40), new)
+        self.assertNotIn(("func_B1", BASE + 0x20, 0x8), new)
+
+    def test_a_call_that_never_returns_in_front_of_a_function_is_split_off(self):
+        stub = [jal(BASE + 0x100), addu(A0, ZERO, ZERO), NOP, NOP]
+        body = [addu(V1, ZERO, ZERO), addiu(SP, SP, -0x18), sw(RA, 0x14), jal(BASE + 0x100), NOP, lw(RA, 0x14), JR_RA,
+                addiu(SP, SP, 0x18)]
+        layout = {BASE: stub + body, BASE + 0x100: self.CALLEE, BASE + 0x200: self.CALLER}
+        rows = [("func_S", BASE, 0x30), ("func_C", BASE + 0x100, 8), ("func_R", BASE + 0x200, 0x1C)]
+        new, applied = b.apply_certain(rows, b.solve(image(layout), rows))
+        self.assertEqual([op["kind"] for op in applied], ["split"])
+        self.assertIn(("func_S", BASE, 8), new)
+        self.assertIn(("func_80001010", BASE + 0x10, 0x20), new)
+        # a call inside an ordinary function (after $ra is saved) is nothing of the kind
+        self.assertIsNone(b.call_stub(image({BASE: self.CALLER}), BASE, 0x1C))
+
+    def test_a_stray_word_in_front_of_a_function_is_released_and_the_function_starts_after_it(self):
+        closed = [addiu(SP, SP, -0x18), sw(RA, 0x14), jal(BASE + 0x100), NOP, lw(RA, 0x14), JR_RA,
+                  addiu(SP, SP, 0x18)]
+        stray = [addu(V1, S0, A0)]                    # decodes, reads registers nothing set: not this function's
+        body = [addiu(SP, SP, -0x18), sw(RA, 0x14), jal(BASE + 0x100), NOP, lw(RA, 0x14), JR_RA, addiu(SP, SP, 0x18)]
+        layout = {BASE: closed, BASE + 0x1C: stray + body, BASE + 0x100: self.CALLEE, BASE + 0x200: self.CALLER}
+        rows = [("func_L", BASE, 0x1C), ("func_T", BASE + 0x1C, 0x20), ("func_C", BASE + 0x100, 8),
+                ("func_R", BASE + 0x200, 0x1C)]
+        ops = b.solve(image(layout), rows)
+        new, applied = b.apply_certain(rows, ops)
+        self.assertEqual([op["kind"] for op in applied], ["shrink"])
+        self.assertIn(("func_80001020", BASE + 0x20, 0x1C), new)
+        self.assertIn(("func_L", BASE, 0x1C), new)                    # the function before it is left alone
+        self.assertEqual(applied[0]["released"], [{"vram": "0x8000101C", "size": "0x00000004", "class": "data"}])
+
+
 class CatalogueFileTest(unittest.TestCase):
     TOML = ('# header\n[[section]]\nname = ".main"\nfunctions = [\n'
             '    { name = "func_A", vram = 0x80001000, size = 0x20 }, # c\n'
@@ -257,3 +342,23 @@ class CommandTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyCatalogueTest(unittest.TestCase):
+    """A survey can write a function table for a segment with no functions (Daikatana, 2026-11-18): it is an
+    empty catalogue, not an unreadable one that stops the whole title's run."""
+
+    def test_a_toml_table_that_lists_no_function_reads_as_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "functions_seg.toml"
+            path.write_text('# Function boundaries for seg: main segment\n[[section]]\nname = ".main"\n'
+                            'rom = 0x00000000\nvram = 0x80230F90\nsize = 0x0\n\nfunctions = [\n]\n')
+            self.assertEqual(b.catalogue_format(path), "toml")
+            self.assertEqual(b.read_catalogue(path), [])
+
+    def test_text_that_is_no_catalogue_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.toml"
+            path.write_text("title = 'x'\n")
+            with self.assertRaises(ValueError):
+                b.catalogue_format(path)

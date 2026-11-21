@@ -138,7 +138,10 @@ def build(recipe: Recipe, source: Path, flags: list[str], include_dirs: list[Pat
               "flags": " ".join(shlex.quote(f) for f in flags),
               "includes": " ".join("-I" + shlex.quote(str(Path(p).resolve())) for p in include_dirs),
               **recipe.variables}
-    environment = {**os.environ, **recipe.env}
+    # TMPDIR is always the private build directory, whatever a lane configures (configured lanes
+    # written before round 12 say "/tmp"): the IDO drivers under qemu-irix write their ctm*
+    # temporaries there, and about 198,000 were left in a RAM-backed /tmp.  Checked with IDO 6.0.
+    environment = {**os.environ, **recipe.env, "TMPDIR": str(workdir)}
     for number, step in enumerate(recipe.steps, 1):
         try:
             argv = shlex.split(step.format(**values))

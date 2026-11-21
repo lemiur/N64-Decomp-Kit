@@ -20,12 +20,21 @@ from ..match import autodraft, m2c_bridge
 from ..match import iterate as itermod
 from ..match import resolve as resolvemod
 from ..match.engine import match_source
-from ..match.pipeline import split_flags
+from ..match.pipeline import SMALL_DATA_LANES, small_data_threshold, split_flags
 from .match import _common, _setup
 
 
 def _int(text: str) -> int:
     return int(text, 0)
+
+
+REDRAFT_DRAFTS = 6             # drafts (decompiler outputs first, then their normal forms) given to the rewrites
+
+
+def _enabled(args, name: str) -> bool:
+    """False when decompile-run switched ``name`` off for an ablation run (``options.disabled``;
+    n64dk.commands.run.ABLATION_SWITCHES).  resolve-hard on its own disables nothing."""
+    return name not in (getattr(args, "disabled", None) or ())
 
 
 def _prepare(args):
@@ -35,9 +44,18 @@ def _prepare(args):
     from ..match.engine import Target
     from ..match.toolchain import load_config
     from ..rom import RomError
+    def extra(syms):
+        # additional symbol files (decompile-run: the program's _gp from its own startup code) are
+        # added to whatever the project's symbols are, never instead of them
+        for path in getattr(args, "extra_symbols", None) or ():
+            if Path(path).is_file():
+                for name, address in symmod.load([Path(path)]).items():
+                    if not dict.__contains__(syms, name):         # the project's own value wins
+                        syms[name] = address
+        return syms
     try:
         cfg, target, syms, _files = _setup(args)
-        return cfg, target, syms
+        return cfg, target, extra(syms)
     except (RomError, SystemExit) as error:
         if args.vram_delta is None:
             raise ValueError(f"{args.rom} is not a ROM with a boot segment ({error}); pass --vram-delta for a "
@@ -47,7 +65,7 @@ def _prepare(args):
         cfg.include = list(dict.fromkeys([Path(cfg.project, value).resolve() for value in args.include] + cfg.include))
     data = Path(args.rom).read_bytes()
     files = [Path(value) for value in args.symbols] or cfg.symbols or symmod.discover(cfg.project)
-    return cfg, Target(data, args.vram_delta, (0, len(data))), symmod.load(files)
+    return cfg, Target(data, args.vram_delta, (0, len(data))), extra(symmod.load(files))
 
 
 def _state(args, cfg) -> Path:
@@ -105,6 +123,7 @@ class _Runner:
         self.rendered, self.facts = None, {}
         self.recipe_map = None
         self.unknown: set[int] = set()       # functions in stretches no known compiler explains
+        self.translator_notes: dict[int, dict] = {}   # vram -> what the unoptimised-code translator made of it
         # alternative m2c renderings tried by the draft portfolio
         self.draft_options = [tuple(o.split("+")) for o in getattr(args, "draft_options", "").split(",") if o]
 
@@ -146,6 +165,19 @@ class _Runner:
                                       outcome=outcome.as_dict()), code
         return evaluate
 
+    def debug_twin(self, vram: int, size: int, filename: str):
+        """The one alternative a large function is offered: its unoptimised GCC recipe with -g (no
+        instruction moves; see ``alternatives``).  [] for any other recipe."""
+        def only(_family):
+            ido = self.spec.pipeline.startswith(("ido", "custom:ido", "custom:mipspro"))
+            if ido or "-O0" not in self.spec.flags or "-g" in self.spec.flags:
+                return []
+            spec = split_flags(list(self.spec.flags) + ["-g"], self.spec.pipeline)
+            spec.section_bases.update(self.spec.section_bases)
+            spec.symbols.update(self.spec.symbols)
+            return [(f"{spec.pipeline} {' '.join(spec.flags)}", spec.pipeline, self.evaluator(vram, size, filename, spec))]
+        return only
+
     def recipes(self, vram: int, size: int, filename: str, limit: int = 12):
         """Alternative build recipes of the detected compiler family, usual retail settings first."""
         from ..match.engine import default_pipelines, sweep_specs
@@ -173,6 +205,36 @@ class _Runner:
             # the function's own code loads globals through $at, which no installed assembler does
             # from a bare symbol load: offer the assembler variant that does (evidence-gated)
             candidates = ["kmc+atload"] + candidates
+        if os.environ.get("N64DK_AT_MACROS") == "1" and "kmc" in self.cfg.available() \
+                and "kmc+atmacro" not in candidates and self.at_branches(vram, size):
+            # and its comparisons go through $at (a branch macro), which KMC GCC never writes.  Opt-in
+            # (N64DK_AT_MACROS=1): on 146 Batman functions it moved drafts ~1% closer and made none
+            # exact, so it is not worth its builds by default (round 12, TOOLCHAIN_REPORT.md)
+            candidates = ["kmc+atmacro"] + candidates
+
+        small_data = (dict.get(self.syms, "_gp") is not None and "kmc" in self.cfg.available()
+                      and self.gp_uses(vram, size))
+        if small_data:
+            # the program declares _gp and this function addresses through $gp: the small-data
+            # lanes (assembler at the compiler's -G), the KMC assembler first
+            lanes = ["kmc+asg"] + (["kmc+gas"] if self.cfg.gas29() is not None else [])
+            candidates = lanes + [p for p in candidates if p not in lanes]
+
+        def small(spec):
+            """A small-data lane at -G0 is the plain lane again: give it the usual -G8."""
+            if spec.pipeline in SMALL_DATA_LANES and small_data_threshold(spec.flags) == 0:
+                flags, skip = [], False
+                for index, flag in enumerate(spec.flags):          # "-G0" or "-G 0"
+                    if skip:
+                        skip = False
+                        continue
+                    if flag == "-G":
+                        skip = index + 1 < len(spec.flags)
+                        continue
+                    if not flag.startswith("-G"):
+                        flags.append(flag)
+                spec.flags = flags + ["-G8"]
+            return spec
 
         def alternatives(family):
             pipelines = [p for p in candidates if is_ido(p) == (family == "ido") and p != self.spec.pipeline]
@@ -203,8 +265,16 @@ class _Runner:
             #   4. the remaining usual settings, in turn.
             def dialect(pipeline: str) -> str:
                 return pipeline[:3] if pipeline[:3] in ("ido", "kmc") else pipeline
-            ordered = [split_flags(list(self.spec.flags), pipeline) for pipeline in pipelines
-                       if dialect(pipeline) == dialect(self.spec.pipeline)]
+            ordered = []
+            if not is_ido(self.spec.pipeline) and "-O0" in self.spec.flags and "-g" not in self.spec.flags:
+                # First of all for unoptimised GCC: the same recipe with debug information.  It moves no
+                # instruction, but with -g GCC emits no no-op between a label and the loop statement after
+                # it, and a title can hold files built both ways.  The drafts-x-recipes stage looks at the
+                # first few alternatives only and has no size gate, so the twin has to stand here to be
+                # tried on a large function that is a near miss (Wheel of Fortune: four functions, 9 KB).
+                ordered.append(split_flags(list(self.spec.flags) + ["-g"], self.spec.pipeline))
+            ordered += [split_flags(list(self.spec.flags), pipeline) for pipeline in pipelines
+                        if dialect(pipeline) == dialect(self.spec.pipeline)]
             # Lanes the project declares for further compilers come last: calibration (which tries
             # every recipe) decides whether the title was built by one of them; trying each of them
             # on every function of a title built by another compiler only costs builds.
@@ -223,6 +293,15 @@ class _Runner:
                     wanted = ("-g" if is_ido(base.pipeline) else "-O0") if other == "unoptimised" else other
                     if level is not None and level != wanted:
                         ordered.append(split_flags([wanted if f == level else f for f in base.flags], base.pipeline))
+                        if wanted == "-O0":
+                            ordered.append(split_flags([wanted if f == level else f for f in base.flags] + ["-g"],
+                                                       base.pipeline))
+            # Unoptimised GCC with debug information: -g moves no instruction, but a line note then stands
+            # between a label and the loop statement after it, so the no-op GCC puts there without -g is not
+            # emitted (Wheel of Fortune: files built both ways; measured 2026-11-18).
+            for base in bases:
+                if not is_ido(base.pipeline) and "-O0" in base.flags and "-g" not in base.flags:
+                    ordered.append(split_flags(list(base.flags) + ["-g"], base.pipeline))
             for rank in range(1, max((len(specs) for specs in swept), default=0)):
                 ordered += [specs[rank] for specs in swept if rank < len(specs)]
             for lane in lanes:
@@ -232,7 +311,9 @@ class _Runner:
                     wanted = "-g" if is_ido(lane) else "-O0"
                     if level is not None:                     # and the same compiler without optimisation
                         ordered.append(split_flags([wanted if f == level else f for f in spec.flags], lane))
-            for spec in ordered:
+                        if wanted == "-O0":
+                            ordered.append(split_flags([wanted if f == level else f for f in spec.flags] + ["-g"], lane))
+            for spec in map(small, ordered):
                 key = (spec.pipeline, tuple(sorted(spec.flags)))
                 if key in seen or (spec.pipeline, tuple(spec.flags)) in seen:
                     continue
@@ -246,7 +327,8 @@ class _Runner:
 
     def _draft(self, name, code, vram, compiler, context, declarations, names, tables, evaluate, extra=None):
         """One draft: m2c, self-contained preparation, recovered declarations, mechanical repairs."""
-        result = m2c_bridge.draft(name, code, vram, compiler, context, names, tables, extra)
+        gp = dict.get(self.syms, "_gp")                     # declared only (never an inferred name)
+        result = m2c_bridge.draft(name, code, vram, compiler, context, names, tables, extra, gp=gp)
         if result.get("source") is None:
             return None, f"{result.get('status')}: {result.get('error')}"
         text = autodraft.prepare(result["source"])
@@ -266,11 +348,49 @@ class _Runner:
             text = fixed
         return text, None
 
+    def behind(self) -> list:
+        """The project's other images as ``(data, vram of the first byte)``: where a jump table of this
+        image's code may stand (m2c_bridge.find_jump_tables, ``also``).  Read once; [] without a registry."""
+        cached = getattr(self, "_behind", None)
+        if cached is None:
+            cached = []
+            try:
+                from ..match import images as imagemod
+                for spec in imagemod.load_registry(self.cfg.project).values():
+                    if spec.delta is None or not spec.path.is_file():
+                        continue
+                    data = spec.load()
+                    if data != self.target.rom:
+                        cached.append((data, spec.delta))
+            except Exception:                                # no registry, or an image that cannot be read
+                cached = []
+            self._behind = cached
+        return cached
+
+    def rewriter(self, name: str, vram: int, size: int):
+        """``text -> [(label, text)]``: the recipe's rewrites of a source of this function, or None when the
+        rewrites are switched off (n64dk.match.resolve.resolve, ``rewrites``)."""
+        if not _enabled(self.args, "redraft"):
+            return None
+        from ..match import redraft
+        offset = vram - self.target.delta
+        code = self.target.rom[offset:offset + size]
+
+        def read(address: int):
+            position = address - self.target.delta
+            return int.from_bytes(self.target.rom[position:position + 4], "big") \
+                if 0 <= position <= len(self.target.rom) - 4 else None
+
+        def rewrites(text: str):
+            return redraft.variants(text, name, code=code, vram=vram, pipeline=self.spec.pipeline,
+                                    flags=tuple(self.spec.flags), family=None, read=read)
+        return rewrites
+
     def drafter(self, name: str, vram: int, size: int, evaluate, names: dict[int, str]):
         def draft(family=None):
             offset = vram - self.target.delta
             code = self.target.rom[offset:offset + size]
-            tables = m2c_bridge.find_jump_tables(self.target.rom, self.target.delta, vram, size)
+            tables = m2c_bridge.find_jump_tables(self.target.rom, self.target.delta, vram, size, also=self.behind())
             if family is None and self.args.pipeline.startswith("custom:"):
                 from ..match import custom_pipeline
                 family = custom_pipeline.family_of(self.args.pipeline, self.cfg.project)
@@ -300,6 +420,12 @@ class _Runner:
                     path.write_text(text)
                     modes.append((label, path, self.rendered.focused(self.facts[vram], vram, include_self,
                                                                      typedefs=False), None))
+            from ..match import layoutinfer
+            if layoutinfer.enabled():
+                # opt-in experiment: competing array / structure-field declarations from this
+                # function's own access widths, offsets and strides (at most 4; drafts only)
+                modes += layoutinfer.draft_modes(name, code, vram, self.work / "context", self.rendered,
+                                                 self.facts)
             modes += [("plain:" + "+".join(flags), None, "", list(flags)) for flags in self.draft_options]
             out, errors = [], []
             for label, context, declarations, extra in modes:
@@ -309,29 +435,51 @@ class _Runner:
                     out.append((label, text))
                 elif error:
                     errors.append(error)
+            from ..match import redraft_gcc_debug
+
+            def read(address: int):
+                at = address - self.target.delta
+                rom = self.target.rom
+                return int.from_bytes(rom[at:at + 4], "big") if 0 <= at <= len(rom) - 4 else None
+
+            def note_translator(found: bool) -> None:
+                if not redraft_gcc_debug.is_unoptimised_gcc(code):
+                    return
+                reason = None if found else redraft_gcc_debug.decline_reason(name, code, vram, read)
+                self.translator_notes[vram] = {"declined": reason} if reason else {"translated": True}
             if not out:
-                return None, "; ".join(errors[:2]) or "m2c produced nothing"
+                # The unoptimised-GCC translator reads the machine code alone: it needs no draft from the
+                # decompiler, only the kit's prelude, so a function the decompiler fails on is still tried.
+                alone = (redraft_gcc_debug.variants("", name, code=code, vram=vram, pipeline=self.spec.pipeline,
+                                                    flags=tuple(self.spec.flags), family=family, read=read)
+                         if _enabled(self.args, "redraft") else [])
+                if _enabled(self.args, "redraft"):
+                    note_translator(bool(alone))
+                if not alone:
+                    return None, "; ".join(errors[:2]) or "m2c produced nothing"
+                return [(f"translated/{kind}", text) for kind, text in alone]
             # normal forms of each draft (loops un-rotated, masks dropped, ...) join the portfolio
             from ..match import draftforms
             texts = {text for _label, text in out}
-            for label, text in list(out)[:2]:
+            for label, text in (list(out)[:2] if _enabled(self.args, "draft-forms") else []):
                 for kind, normal, _review in draftforms.drafts(text, name):
                     if normal not in texts:
                         texts.add(normal)
                         out.append((f"{label}/{kind}", normal))
             # recipe-specific rewrites of the first drafts (n64dk.match.redraft): computed from the
-            # target's own machine code, e.g. the frame layout of an unoptimised build
+            # target's own machine code, e.g. the frame layout of an unoptimised build.  The normal forms
+            # of those drafts are rewritten as well: a rewrite keyed on how a loop or a temporary is written
+            # may apply to the normal form only (measured on a title: two functions matched from the form
+            # the search reached later and not from the first draft)
             from ..match import redraft
-            for label, text in list(out)[:2]:
-                def read(address: int):
-                    at = address - self.target.delta
-                    rom = self.target.rom
-                    return int.from_bytes(rom[at:at + 4], "big") if 0 <= at <= len(rom) - 4 else None
+            for label, text in (list(out)[:REDRAFT_DRAFTS] if _enabled(self.args, "redraft") else []):
                 for kind, variant in redraft.variants(text, name, code=code, vram=vram, pipeline=self.spec.pipeline,
                                                       flags=tuple(self.spec.flags), family=family, read=read):
                     if variant not in texts:
                         texts.add(variant)
                         out.append((f"{label}/{kind}", variant))
+            if _enabled(self.args, "redraft"):
+                note_translator(any("gcc-O0-translated" in label for label, _text in out))
             return out
         def assembly():
             """(source, proof) for a hand-written function whose assembly assembles back to its bytes."""
@@ -339,9 +487,10 @@ class _Runner:
             offset = vram - self.target.delta
             code = self.target.rom[offset:offset + size]
             return handasm.attempt(name, code, vram, self.cfg, names,
-                                   m2c_bridge.find_jump_tables(self.target.rom, self.target.delta, vram, size))
+                                   m2c_bridge.find_jump_tables(self.target.rom, self.target.delta, vram, size, also=self.behind()))
 
-        draft.assembly = assembly
+        if _enabled(self.args, "handasm"):          # switched off: hand-written code stays unsettled
+            draft.assembly = assembly
         return draft
 
     def strict(self, vram: int, size: int, filename: str, starts: set[int] | None):
@@ -366,8 +515,17 @@ class _Runner:
             # only independently declared symbols: names in the candidate's own text prove nothing
             symbols = self.syms.copy()
             symbols.update(spec.symbols)
-            return verifymod.strict_compare(elf, self.target.rom, self.target.vram_to_rom, vram, size, symbols,
-                                            spec.section_bases, None, starts).as_dict()
+            # A section of the unit (a switch's jump table, its constants) whose address the code gives
+            # and whose own bytes are then found there is placed by its contents, as a donor unit's is.
+            from ..match import transplant
+            verdict, confirmed = transplant.confirm_sections(
+                lambda bases: verifymod.strict_compare(elf, self.target.rom, self.target.vram_to_rom, vram, size,
+                                                       symbols, bases, None, starts),
+                elf, dict(spec.section_bases))
+            out = verdict.as_dict()
+            if confirmed:
+                out["corroborated"] = {name: f"0x{address:08X}" for name, address in sorted(confirmed.items())}
+            return out
         return check
 
     def find_unknown(self, functions) -> dict | None:
@@ -419,8 +577,23 @@ class _Runner:
         window = self._unopt[max(0, index - self.NEIGHBOURHOOD):index + self.NEIGHBOURHOOD + 1]
         return bool(window) and 4 * sum(flag for _v, flag in window) >= len(window)
 
+    def gp_uses(self, vram: int, size: int) -> bool:
+        """The function's own code addresses memory through ``$gp`` (loads, stores, ``addiu``)."""
+        from ..analysis import gp as gpmod
+        offset = vram - self.target.delta
+        code = self.target.rom[offset:offset + size]
+        return gpmod.scan(code, vram, [("", vram, len(code))])["uses"] > 0
+
+    def at_branches(self, vram: int, size: int) -> bool:
+        """The function's code compares into ``$at`` for a branch (a branch macro)."""
+        from ..match import macros
+        offset = vram - self.target.delta
+        return macros.signatures(self.target.rom[offset:offset + size], vram)["at-branch"] > 0
+
     def at_loads(self, vram: int, size: int) -> bool:
         """The function's code loads a global through ``$at`` right after ``lui $at``."""
+        if not _enabled(self.args, "at-loads"):
+            return False                               # the lane is switched off (ablation)
         from ..match import idioms
         offset = vram - self.target.delta
         return "at=direct-load" in idioms.features(self.target.rom[offset:offset + size], vram, sequences=False)
@@ -634,7 +807,10 @@ def _retry_under_recipes(store, image: str, rows, target, runner, names, emit, s
                                       flow=runner.flow(vram, size), neighbours=starts, budget=args.budget,
                                       search_ceiling=getattr(args, "search_ceiling", resolvemod.SEARCH_CEILING),
                                       jobs=2, emit=emit, pipeline=spec.pipeline, recipe_label=label, rom_offset=offset,
-                                      strict=runner.strict(vram, size, f"{name}.c", starts), recipes=None, fresh=True)
+                                      strict=runner.strict(vram, size, f"{name}.c", starts), recipes=None, fresh=True,
+                                      frame_fit=_enabled(args, "frame-fit"), search=_enabled(args, "search"),
+                                      hand_forms=_enabled(args, "hand-forms"),
+                                      rewrites=runner.rewriter(name, vram, size))
         except Exception as error:                           # one bad function must not stop the pass
             if emit:
                 emit({"event": "case-error", "name": name, "error": str(error)[-300:]})
@@ -667,6 +843,22 @@ def _retry_under_recipes(store, image: str, rows, target, runner, names, emit, s
 # of the code; the translators for unoptimised builds match some of them outright (23 of 447 on
 # four titles), and searching them costs the most and returns the least.
 LARGE_FUNCTION = 0x400
+# No function larger than 6,244 bytes has ever been recovered (2026-11-18, 28 titles); catalogue entries of
+# 400-860 KB (merged code and data) drove the resolver worker past 3 and 6 GB.  Above this ceiling a function
+# is not attempted; it stays assembly with the reason recorded.
+IMPLAUSIBLE_FUNCTION_BYTES = 0x20000        # real functions of 17 KB (Wheel of Fortune) and 38 KB (Virtual Chess) exist
+
+
+def implausible_size() -> int:
+    """The size above which a catalogue entry is not attempted (0: no ceiling)."""
+    import os
+    text = os.environ.get("N64DK_IMPLAUSIBLE_FUNCTION_BYTES", "").strip()
+    if not text:
+        return IMPLAUSIBLE_FUNCTION_BYTES
+    try:
+        return int(text, 0)
+    except ValueError:
+        return IMPLAUSIBLE_FUNCTION_BYTES
 
 REGION_EVIDENCE_LIMIT = 400      # matched functions rebuilt under the other recipes, spread over the image
 REGION_RECIPES = 6               # recipes compared (the most common among the matches)
@@ -900,7 +1092,9 @@ def _refine_pass(store, image: str, todo, target, runner, names, emit, starts, s
                                       flow=flow, neighbours=starts, budget=args.budget, jobs=2,
                                       force=True, emit=emit, pipeline=pipeline, recipe_label=label, rom_offset=offset,
                                       strict=runner.strict(vram, size, f"{name}.c", starts),
-                                      search_ceiling=getattr(args, "search_ceiling", resolvemod.SEARCH_CEILING))
+                                      search_ceiling=getattr(args, "search_ceiling", resolvemod.SEARCH_CEILING),
+                                      frame_fit=_enabled(args, "frame-fit"), search=_enabled(args, "search"),
+                                      hand_forms=_enabled(args, "hand-forms"))
             case.builds += before
         case.stages.append(stage)
         store.put(case)
@@ -937,6 +1131,65 @@ def only_names(value) -> set[str]:
             elif part:
                 out.add(part)
     return out
+
+
+WORKER_BATCH = 150
+
+
+def worker_batch() -> int:
+    """Functions one worker process resolves before it exits and a fresh one takes over
+    (``N64DK_WORKER_BATCH``; 0 or less means one process per shard, the behaviour before recycling)."""
+    text = os.environ.get("N64DK_WORKER_BATCH", "").strip()
+    try:
+        value = int(text) if text else WORKER_BATCH
+    except ValueError:
+        value = WORKER_BATCH
+    return value if value > 0 else 10 ** 9
+
+
+WORKER_BATCH_BYTES = 0x10000
+LARGE_SERIAL_BYTES = 0x800
+
+
+def _env_int(name: str, default: int) -> int:
+    text = os.environ.get(name, "").strip()
+    try:
+        return int(text, 0) if text else default
+    except ValueError:
+        return default
+
+
+def worker_batch_bytes() -> int:
+    """Code bytes one worker process resolves before it is recycled (``N64DK_WORKER_BATCH_BYTES``; 0 or
+    less: no byte limit).  Large functions leave the most memory behind, so their batches are shorter."""
+    value = _env_int("N64DK_WORKER_BATCH_BYTES", WORKER_BATCH_BYTES)
+    return value if value > 0 else 10 ** 12
+
+
+def large_serial_bytes() -> int:
+    """Functions larger than this run one at a time within a worker process (``N64DK_LARGE_SERIAL_BYTES``;
+    0 or less: never)."""
+    value = _env_int("N64DK_LARGE_SERIAL_BYTES", LARGE_SERIAL_BYTES)
+    return value if value > 0 else 10 ** 12
+
+
+def batches_of(shards, count: int, size_limit: int) -> list:
+    """``(worker index, functions)`` batches, interleaved across shards in shard order: each batch ends at
+    ``count`` functions or once its code reaches ``size_limit`` bytes (a batch always takes one function)."""
+    split = []
+    for index, shard in enumerate(shards):
+        chunks, current, total = [], [], 0
+        for function in shard:
+            if current and (len(current) >= count or total + function[2] > size_limit):
+                chunks.append(current)
+                current, total = [], 0
+            current.append(function)
+            total += function[2]
+        if current:
+            chunks.append(current)
+        split.append(chunks)
+    return [(index, split[index][k]) for k in range(max((len(c) for c in split), default=0))
+            for index in range(len(split)) if k < len(split[index])]
 
 
 def worker_count(requested: int | None, functions: int, memory_per_worker_mb: int = 0,
@@ -981,14 +1234,15 @@ def resolve_case(args):
     catalogue_vram = args.addr
     linked_vram = getattr(args, "_comparison_addr", catalogue_vram)
     coordinate_shift = catalogue_vram - linked_vram
-    names = {address: name for name, address in syms.items()}
+    names = {address: name for name, address in syms.items() if name != "_gp"}
     name = args.name or names.get(linked_vram) or f"func_{catalogue_vram:08X}"
     store = resolvemod.CaseStore(_state(args, cfg))
     emit, handle = _events(args.events)
     try:
         with tempfile.TemporaryDirectory(prefix="n64dk-resolve-") as work:
             runner = _Runner(args, cfg, target, syms, Path(work))
-            runner.functions_for_gate = functions
+            runner.functions_for_gate = ([(n, v - coordinate_shift, s) for n, v, s in load_catalogue(Path(args.catalogue))]
+                                         if args.catalogue else [])
             if args.context == "auto":
                 if not args.catalogue:
                     raise SystemExit("--context auto needs --catalogue")
@@ -1014,6 +1268,8 @@ def resolve_case(args):
                                       recipes=None if args.no_recipes else runner.recipes(
                                           linked_vram, args.size, Path(args.source).name if args.source else f"{name}.c"))
         result = case.as_dict()
+        if getattr(args, "_name_findings", None):
+            result["name_findings"] = args._name_findings
         result["coordinates"] = {"image": _image_label(args),
                                  "catalogue_vram": f"0x{catalogue_vram:08X}",
                                  "linked_vram": f"0x{linked_vram:08X}",
@@ -1096,7 +1352,7 @@ def resolve_hard(args):
         coordinate_shift = probe_addr - linked_probe
     else:
         coordinate_shift = args.catalogue_shift
-    names = {address: name for name, address in syms.items()}
+    names = {address: name for name, address in syms.items() if name != "_gp"}
     functions = [(n, v - coordinate_shift, s) for n, v, s in catalogue_functions]
     trimmed = {"functions": 0, "bytes": 0}
     if not getattr(args, "keep_padding", False):
@@ -1160,6 +1416,11 @@ def resolve_hard(args):
     if chosen_names:                                             # a named set: nothing else is attempted
         todo = keep(todo, [f for f in todo if f[0] in chosen_names], "not in the --only-names set")
     todo.sort(key=lambda f: f[2])
+    ceiling = implausible_size()
+    if ceiling:
+        todo = keep(todo, [f for f in todo if f[2] <= ceiling],
+                    f"implausibly large for one function (over 0x{ceiling:X} bytes): most likely a boundary error "
+                    "that merged code or data; kept as assembly (N64DK_IMPLAUSIBLE_FUNCTION_BYTES changes the ceiling)")
     if args.max_size:
         todo = keep(todo, [f for f in todo if f[2] <= args.max_size], f"larger than the run's --max-size 0x{args.max_size:X}")
     if args.every > 1:
@@ -1209,13 +1470,24 @@ def resolve_hard(args):
             if unknown_info and emit:
                 emit({"event": "unknown-toolchain", **unknown_info})
 
+            large_turn = threading.Semaphore(1)        # forked workers each get their own, never held at fork
+
             def one(function, store=store, emit=emit, inner=inner):
+                name, vram, size = function
+                if size > large_serial_bytes():
+                    # one large function at a time per process: a 4-7 KB function alone peaks near 500 MB
+                    # (measured 2026-11-18), and two at once on each of two workers took jobs over 3 GB
+                    with large_turn:
+                        return _one(function, store, emit, inner)
+                return _one(function, store, emit, inner)
+
+            def _one(function, store, emit, inner):
                 name, vram, size = function
                 offset = vram - target.delta
                 spec = runner.spec_for(vram)
                 evaluate = runner.evaluator(vram, size, f"{name}.c", spec)
                 try:
-                    return resolvemod.resolve(store, image, name, vram, target.rom[offset:offset + size], evaluate,
+                    case = resolvemod.resolve(store, image, name, vram, target.rom[offset:offset + size], evaluate,
                                               draft=None if args.no_draft else runner.drafter(name, vram, size,
                                                                                               evaluate, names),
                                               flow=runner.flow(vram, size), neighbours=starts, budget=args.budget,
@@ -1225,17 +1497,28 @@ def resolve_hard(args):
                                                               getattr(args, "search_ceiling",
                                                                       resolvemod.SEARCH_CEILING)),
                                               cross_recipes=getattr(args, "cross_recipes", None),
+                                              frame_fit=_enabled(args, "frame-fit"), search=_enabled(args, "search"),
+                                      hand_forms=_enabled(args, "hand-forms"),
+                                              rewrites=runner.rewriter(name, vram, size),
+                                              drafts_x_recipes=_enabled(args, "cross-recipes"),
                                               jobs=inner, force=args.force, emit=emit, pipeline=spec.pipeline,
                                               recipe_label=runner.label(spec), rom_offset=offset,
                                               strict=runner.strict(vram, size, f"{name}.c", starts),
-                                              recipes=None if args.no_recipes or size > LARGE_FUNCTION else runner.recipes(vram, size,
-                                                                                                  f"{name}.c"),
+                                              recipes=(None if args.no_recipes else
+                                                       runner.debug_twin(vram, size, f"{name}.c") if size > LARGE_FUNCTION
+                                                       else runner.recipes(vram, size, f"{name}.c")),
                                               governor=governor, fresh=bool(getattr(args, "fresh", False)),
                                               provisional=bool(getattr(args, "provisional", False)),
                                               wide_recipes=((lambda vram=vram: runner.unoptimised_near(vram))
                                                             if getattr(args, "recipe_gate", False) else None),
                                               stratum=(f"{image} | {runner.label(spec)} | "
                                                        f"{'unknown toolchain' if vram in runner.unknown else 'known toolchain'}"))
+                    note = runner.translator_notes.pop(vram, None)
+                    if note and case is not None and case.status not in ("exact", "assumed"):
+                        # what the unoptimised-code translator made of the function: the reason code names it
+                        case.stages = [s for s in case.stages if s.get("stage") != "translator"] + [{"stage": "translator", **note}]
+                        store.put(case)
+                    return case
                 except Exception as error:                   # one bad function must not stop the sweep
                     if emit:
                         emit({"event": "case-error", "name": name, "error": str(error)[-300:]})
@@ -1258,13 +1541,22 @@ def resolve_hard(args):
                 # threads per worker are oversubscribed: most of their time is spent waiting for a
                 # compiler process or for the interpreter lock
                 share = max(4, (3 * (args.jobs or 8)) // (2 * workers))
-                children = []
-                for index in range(workers):
+                # Workers are recycled: each process takes one batch of its shard and exits, and a fresh
+                # process takes the next.  A worker's memory grows with the work it has done and only an
+                # exit returns it (measured 2026-11-18: two workers reached ~1.5 GB each on their largest
+                # functions and took six titles over a 3 GB job cap; traced Python objects stayed under
+                # 400 MB, malloc arenas and the disassembler were ruled out).  At most ``workers`` run at once.
+                batch = worker_batch()
+                shards = [todo[index::workers] for index in range(workers)]
+                pending = batches_of(shards, batch, worker_batch_bytes())
+                running: dict[int, int] = {}
+                from .. import safety
+
+                def launch(index, chunk):
                     pid = os.fork()
                     if pid == 0:
                         status = 1
                         try:
-                            from .. import safety
                             safety.forked()
                             own_store = resolvemod.CaseStore(_state(args, cfg))
                             own_emit, _own_handle = _events(args.events)
@@ -1272,33 +1564,46 @@ def resolve_hard(args):
                             runner.work.mkdir(parents=True, exist_ok=True)
                             own_inner = 2
                             with ThreadPoolExecutor(max(2, share // own_inner)) as pool:
-                                list(pool.map(lambda f: one(f, own_store, own_emit, own_inner), todo[index::workers]))
+                                list(pool.map(lambda f: one(f, own_store, own_emit, own_inner), chunk))
                             own_store.close()
                             status = 0
                         finally:
                             safety.flush_usage()              # the run's profile adds up its tools and builds
                             os._exit(status)                  # never run the parent's cleanup twice
-                    children.append(pid)
-                    from .. import safety
-                    safety.register_child(pid)          # SIGTERM reaches the worker too
+                    running[pid] = index
+                    safety.register_child(pid)                # SIGTERM reaches the worker too
+
+                batches = len(pending)
                 try:
-                    for pid in children:
-                        _pid, status = os.waitpid(pid, 0)
-                        worker_errors += status != 0
+                    while pending or running:
+                        while pending and len(running) < workers:
+                            launch(*pending.pop(0))
+                        reaped = False
+                        for pid in list(running):
+                            done, status = os.waitpid(pid, os.WNOHANG)
+                            if done:
+                                running.pop(pid)
+                                safety.unregister_child(pid)
+                                worker_errors += status != 0
+                                reaped = True
+                        if not reaped:
+                            time.sleep(0.2)
                 except BaseException:
-                    for pid in children:
+                    for pid in running:
                         try:
                             os.kill(pid, 15)
                         except ProcessLookupError:
                             pass
-                    for pid in children:
+                    for pid in running:
                         try:
                             os.waitpid(pid, 0)
                         except ChildProcessError:
                             pass
                     if emit:
-                        emit({"event": "workers-cancelled", "count": len(children)})
+                        emit({"event": "workers-cancelled", "count": len(running)})
                     raise
+                if emit:
+                    emit({"event": "worker-batches", "workers": workers, "batch": batch, "batches": batches})
                 store = resolvemod.CaseStore(_state(args, cfg))
                 if worker_errors and emit:
                     emit({"event": "worker-failed", "count": worker_errors})
@@ -1307,7 +1612,8 @@ def resolve_hard(args):
             else:
                 with ThreadPoolExecutor(max(1, (args.jobs or 8) // inner)) as pool:
                     cases = [c for c in pool.map(one, todo) if c is not None]
-            twins = _twin_pass(store, image, todo, target, runner, names, emit, starts)
+            twins = (_twin_pass(store, image, todo, target, runner, names, emit, starts)
+                     if _enabled(args, "twin") else [])
             if twins:
                 replaced = {c.case_id for c in twins}
                 cases = [c for c in cases if c.case_id not in replaced] + twins

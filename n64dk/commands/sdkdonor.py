@@ -51,8 +51,10 @@ def _args(p):
     p.add_argument("--source", required=True, help="libultra source tree (src/, include/, makefiles/, base/)")
     p.add_argument("--out", required=True, help="directory for the images, manifests and donors.toml")
     p.add_argument("--versions", default="D,E,F,G,H,I,J,K,L", help="comma-separated SDK versions (2.0D .. 2.0L)")
-    p.add_argument("--flavours", default="libgultra_rom,libultra_rom",
-                   help="comma-separated builds: libgultra[_rom|_d] (GCC), libultra[_rom|_d] (IDO)")
+    p.add_argument("--flavours", default="libgultra_rom,libultra_rom,libgultra,libultra",
+                   help="comma-separated builds: libgultra[_rom|_d] (GCC), libultra[_rom|_d] (IDO); the plain "
+                        "builds (_FINALROM and _DEBUG undefined, NDEBUG) are the ones a title linking rmon "
+                        "and the debug-port exception code was built with")
     p.add_argument("--toolchain-dir", help="toolchain root (default: N64DK_TOOLCHAIN)")
     p.add_argument("--jobs", type=int, default=4, help="compilers run at once")
 

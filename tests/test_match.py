@@ -1504,6 +1504,12 @@ class TextTests(unittest.TestCase):
         self.assertIn("\tlwc1 $f6, %lo(RODATA_SYM_0+4)($at)\n", out)
         self.assertNotIn("\tldc1 ", out)
 
+    def test_asn64_mfp32_does_not_enable_title_specific_double_layout(self):
+        source = "# Cc1 arguments: -mips3 -mfp32\n\n\tli.d\t$f6,5.0e-1\n"
+        out = asn64.convert(source)
+        self.assertIn("\tldc1 $f6, %lo(RODATA_SYM_0)($at)\n", out)
+        self.assertNotIn("\tlwc1 $f7", out)
+
     def test_asn64_opt_in_kmc_double_literal_align4(self):
         out = asn64.convert(
             "\tli.s\t$f4,1.0\n\tli.d\t$f6,5.0e-1\n",

@@ -1,0 +1,38 @@
+name: ci-gates
+
+# The release gates of tools/ci_gates.sh (docs/safety.md, "CI gates"): one step at a time, each
+# under a timeout; the job fails when any gate fails.  tests.yml keeps the per-version suite.
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: py311
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -e .
+      # No ROMs or toolchains here: tests that need them skip.  Without a systemd user manager the
+      # per-step memory cap falls back to an address-space limit (ulimit -v).
+      - name: Gates
+        env:
+          PYTHON: python
+          CI_PY311: ${{ steps.py311.outputs.python-path }}
+          CI_REQUIRE_PY311: "1"
+          CI_LOG_DIR: ${{ runner.temp }}/ci-gates
+        run: sh tools/ci_gates.sh
+      - name: Gate logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gates-logs
+          path: ${{ runner.temp }}/ci-gates

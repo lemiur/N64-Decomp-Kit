@@ -43,6 +43,7 @@ class Profile:
     family: str         # "gcc", "ido" or "sn"
     default_flags: tuple[str, ...]
     required: tuple[str, ...]  # files that must exist inside the toolchain directory
+    host: tuple[str, ...] = ()  # host programs the lane runs (on PATH): the SN lane preprocesses with the host gcc
 
 
 PROFILES: dict[str, Profile] = {
@@ -52,8 +53,16 @@ PROFILES: dict[str, Profile] = {
     "ido71": Profile("ido71", "IDO 7.1", "ido", ("-O2", "-mips2", "-non_shared", "-G", "0"), ("cc",)),
     "sn": Profile("sn", "SN GCC 2.8", "sn",
                   ("-O2", "-G0", "-mcpu=vr4300", "-mips3", "-mhard-float", "-meb"),
-                  ("wibo", "cc1n64.exe", "asn64.exe", "psyq-obj-parser")),
+                  ("wibo", "cc1n64.exe", "asn64.exe", "psyq-obj-parser"), ("gcc",)),
 }
+
+
+def missing_host(key: str) -> list[str]:
+    """Host programs toolchain ``key``'s lane runs that are not on PATH (on a fresh Ubuntu the SN lane's
+    preprocessor, the host gcc, is absent: every SN build then fails and the run silently loses the lane)."""
+    import shutil
+    profile = PROFILES.get(key)
+    return [name for name in (profile.host if profile else ()) if shutil.which(name) is None]
 
 
 @dataclass
@@ -88,10 +97,27 @@ class Config:
         profile = PROFILES.get(key)
         if profile and not all((path / f).is_file() for f in profile.required):
             return None
+        if profile and profile.host and missing_host(key):
+            return None                  # a lane whose host program is absent cannot build: never silently "usable"
         return path
 
     def available(self) -> list[str]:
         return [k for k in PROFILES if self.toolchain(k) is not None]
+
+    GAS29_DIRS = ("gcc2.8.1pm", "egcs_1.1.2-4c", "egcs_1.1.2-4")
+
+    def gas29(self) -> Path | None:
+        """A period GNU ``as`` 2.9.x (the ``kmc+gas`` assembler component): ``[toolchains] gas29``,
+        else the first of ``GAS29_DIRS`` under the toolchain root that holds an ``as``.  Unlike KMC
+        ``as`` 2.6, it makes a symbol declared ``.extern name, size`` GP-relative under ``-G``."""
+        configured = self.toolchains.get("gas29")
+        candidates = [configured] if configured else (
+            [self.toolchain_root / name for name in self.GAS29_DIRS] if self.toolchain_root else [])
+        for folder in candidates:
+            exe = Path(folder) / "as"
+            if exe.is_file():
+                return exe
+        return None
 
     def gnu_as(self) -> tuple[str, dict[str, str]] | None:
         """Modern MIPS GNU as (path, extra environment) for the ASN64 lane."""

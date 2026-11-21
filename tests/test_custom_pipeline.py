@@ -65,6 +65,16 @@ class CustomPipelineTest(unittest.TestCase):
         self.assertEqual(obj.read_bytes().decode(), f"-O2 -DNAME=a b -I{include.resolve()}|int x;POST")
         self.assertEqual(sorted(p.name for p in self.project.iterdir()), ["n64dk.toml"])    # nothing leaked
 
+    def test_temporaries_go_to_the_private_directory(self):
+        project = project_with(
+            '[pipelines.tmp]\nfamily = "ido"\ntimeout = 5\nenv = { TMPDIR = "/tmp" }\nsteps = [\n'
+            f'  "{sys.executable} -c \\"import os, sys; open(sys.argv[1], \'w\').write(os.environ[\'TMPDIR\'])\\" {{object}}",\n]\n')
+        work = Path(_scratch())
+        source = work / "unit.c"
+        source.write_text("int x;")
+        obj = cp.build(cp.recipe_for("custom:tmp", project), source, [], [], work, project)
+        self.assertEqual(obj.read_text(), str(work.resolve()))     # never the shared /tmp
+
     def test_failures_are_reported_with_the_step(self):
         project = project_with('[pipelines.bad]\nsteps = ["%s -c \\"import sys; print(\'boom\'); sys.exit(3)\\""]\n'
                                % sys.executable)

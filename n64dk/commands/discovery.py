@@ -178,8 +178,32 @@ def coverage_verdict(found: dict, after: bool = False) -> str:
 def discovery_audit(args):
     result = run_audit(Path(args.project).resolve(), args.image or None,
                        Path(args.out).resolve() if args.out else None, args.repair)
+    if getattr(args, "overlays", False):
+        result["overlays"] = overlay_report(Path(args.project).resolve(), args.image or None)
+        if args.out:
+            Path(args.out).mkdir(parents=True, exist_ok=True)
+            (Path(args.out) / "overlays.json").write_text(json.dumps(result["overlays"], indent=1) + "\n")
+    if getattr(args, "indirect", False):
+        result["indirect"] = indirect_report(Path(args.project).resolve(), args.image or None)
+        if args.out:
+            Path(args.out).mkdir(parents=True, exist_ok=True)
+            (Path(args.out) / "indirect.json").write_text(json.dumps(result["indirect"], indent=1) + "\n")
     if getattr(args, "format", "text") == "text":
         print(render(result))
+        for name, rep in (result.get("overlays") or {}).items():
+            print(f"overlays {name}: {rep['moved_runs']} run(s) would move; calls landing on a start "
+                  f"{rep['calls_landing_now']} now, {rep['calls_landing_inferred']} inferred (report only)")
+        for name, rep in (result.get("indirect") or {}).items():
+            if "error" in rep:
+                print(f"indirect {name}: not analysed: {rep['error']}")
+                continue
+            status = rep["by_status"]
+            print(f"indirect {name}: {rep['jr_sites']} jr + {rep['jalr_sites']} jalr sites: "
+                  + ", ".join(f"{k} {v}" for k, v in status.items())
+                  + f"; {rep['switch_tables']} switch tables ({rep['switch_table_bytes']} bytes, "
+                  f"{rep['tables_inside_catalogued_functions']} inside catalogued functions); "
+                  f"{rep['no_return']} non-returning functions, {rep['fake_fallthroughs_into_code']} "
+                  f"fake fall-throughs into code (report only)")
         return 0 if result["verdict"] != "incomplete" or args.no_fail else 3
     return result
 
@@ -192,6 +216,47 @@ def _args(p):
                    help="place code the title calls but no image holds, and add evidence-backed functions to "
                         "incomplete catalogues; writes under --out, never into the project")
     p.add_argument("--no-fail", action="store_true", help="exit 0 even when a catalogue is incomplete")
+    p.add_argument("--overlays", action="store_true",
+                   help="also infer per-overlay bases inside each image (a segment holding several separately "
+                        "linked overlays); a report only, never applied to a catalogue")
+    p.add_argument("--indirect", action="store_true",
+                   help="also resolve jr/jalr targets (switch tables, pointer tables, stored pointers) and "
+                        "non-returning functions (n64dk.analysis.indirect); a report only, never applied "
+                        "to a catalogue")
+
+
+def overlay_report(project: Path, images=None) -> dict:
+    """``n64dk.analysis.overlays.report`` for each image (catalogue starts and prologue evidence)."""
+    from ..analysis import coverage, overlays
+    from ..match import images as imagemod
+    out = {}
+    for name in sorted(imagemod.load_registry(project)):
+        if images and name not in images:
+            continue
+        spec = imagemod.resolve(project, name)
+        data = spec.load()
+        starts = {vram - spec.delta for _n, vram, _s in spec.rows() if 0 <= vram - spec.delta < len(data)}
+        out[name] = overlays.report(data, spec.delta, starts | coverage._start_offsets(data))
+    return out
+
+
+def indirect_report(project: Path, images=None) -> dict:
+    """``n64dk.analysis.indirect.analyse_image(...).summary()`` for each image (its catalogue)."""
+    from ..analysis import coverage, indirect
+    from ..match import images as imagemod
+    out = {}
+    for name in sorted(imagemod.load_registry(project)):
+        if images and name not in images:
+            continue
+        try:
+            spec = imagemod.resolve(project, name)
+            data = spec.load()
+            rows = coverage.rows_of(spec)
+        except Exception as error:                        # noqa: BLE001 - reported, not fatal
+            out[name] = {"error": str(error)[:200]}
+            continue
+        out[name] = indirect.analyse_image(data, spec.delta, rows).summary()
+    return out
 
 
 discovery_audit.arguments = _args

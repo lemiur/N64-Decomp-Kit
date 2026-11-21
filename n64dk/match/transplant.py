@@ -70,6 +70,8 @@ EXACT_VERDICT = "exact-with-transferred-symbols"
 ASSUMED_VERDICT = "identical-awaiting-symbols"
 CORROBORATING_BYTES = 8         # a section's contents confirm its address from this many bytes on
 NEAR_MIN_WORDS = 6
+SAME_FUNCTION_MIN = 12          # bytes of a catalogued function before its code can name it
+DATA_NONZERO = 8                # non-zero bytes a datum needs before its contents say where it is
 AUTO_NAME = re.compile(r"^(?:func|D|B|jtbl|L|sym|data)_[0-9A-Fa-f]{6,8}$|^0x[0-9A-Fa-f]+$")
 INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
 HEX = re.compile(r"^(0x)?[0-9A-Fa-f]+$")
@@ -480,6 +482,20 @@ def _lost_lo(a: int, b: int) -> bool:
     return rs not in (0, 29) and (op == 9 or 0x20 <= op <= 0x3F)
 
 
+def only_lost_lo(dmasked: list[int], masked: list[int], code: bytes) -> list[int] | None:
+    """The word indices where a donor function and target code of the same length differ, when
+    every one of them is a ``%lo`` half the straight-line pair tracker lost (its ``lui`` is on
+    another path, so the immediate was not masked): the masked words differ, the code may not.
+    ``None`` when the lengths differ or any other word does; ``[]`` when nothing differs."""
+    if len(dmasked) != len(masked):
+        return None
+    diffs = [i for i, (a, b) in enumerate(zip(dmasked, masked)) if a != b]
+    bases = {w >> 16 & 31 for w in words_of(code) if w >> 26 == 15}          # registers a lui sets
+    if all(_lost_lo(dmasked[i], masked[i]) and (masked[i] >> 21) & 31 in bases for i in diffs):
+        return diffs
+    return None
+
+
 def scan(image: bytes, vram_delta: int, functions: list[tuple[str, int, int]], index: Index,
          near_max: int = 2) -> list[Hit]:
     """Exact and near masked-signature hits for each target ``(name, vram, size)``."""
@@ -587,6 +603,100 @@ def corroborate(hits: list[Hit], functions: list[tuple[str, int, int]], order: d
     return fixed
 
 
+_COPY_KEYS: dict[str, dict] = {}
+MAX_COPIES = 4                  # copies of one function a library is expected to hold (the Pi and Si twins: two)
+
+
+def donor_copies(donor: dict, vram: int, size: int) -> list[int]:
+    """The addresses in a donor's image where the masked code of its function at ``vram`` stands (the
+    function itself included), ascending.  Found by the code alone, so copies no donor unit lists count."""
+    image = _donor_image(donor["image"])
+    delta = donor["delta"]
+    keys = _COPY_KEYS.get(donor["image"])
+    if keys is None:
+        keys = defaultdict(list)
+        for offset in range(0, len(image) - 11, 4):
+            keys[(image[offset] >> 2, image[offset + 4] >> 2, image[offset + 8] >> 2)].append(offset)
+        _COPY_KEYS[donor["image"]] = keys
+    start = vram - delta
+    code = image[start:start + size]
+    if start < 0 or len(code) != size or size < 12:
+        return []
+    want = mask(code, vram)[0]
+    places = []
+    for offset in keys.get((code[0] >> 2, code[4] >> 2, code[8] >> 2), ()):
+        there = image[offset:offset + size]
+        if len(there) == size and mask(there, offset + delta)[0] == want:
+            places.append(offset + delta)
+    return places
+
+
+def pair_copies(hits: list[Hit], index: "Index") -> tuple[list[Hit], int]:
+    """Give each copy of a function that stands several times in the title its donor copy, by their order.
+
+    A library holds some routines twice with other data (the access queues of two devices); the same
+    masked code then stands at two places of the title, and a hit says nothing about which is which.  The
+    donor holds the copies too, and a library's objects keep their order from one title to the next: when
+    the donor's image has as many copies as the title (at most MAX_COPIES), the k-th copy there is the
+    k-th here.  The hit at that place is ``placed``; this donor function's hits at the other places are
+    dropped (they are its twins').  What the pairing decides is which names the place gets: the code is
+    the same at every copy, and each unit is still compared strictly at its own place.  Returns
+    (hits, places fixed)."""
+    targets: dict[int, set[int]] = defaultdict(set)
+    for hit in hits:
+        if hit.kind == "exact":
+            targets[id(hit.function)].add(hit.vram)
+    keep, fixed, decided = [], 0, {}
+    for hit in hits:
+        places = sorted(targets[id(hit.function)]) if hit.kind == "exact" else []
+        if len(places) < 2 or len(places) > MAX_COPIES or hit.placed:
+            keep.append(hit)
+            continue
+        key = id(hit.function)
+        if key not in decided:
+            donor = index.donors.get(hit.donor)
+            try:
+                copies = donor_copies(donor, hit.function["vram"], hit.function["size"]) if donor else []
+            except (OSError, KeyError, ValueError):
+                copies = []
+            decided[key] = (places[copies.index(hit.function["vram"])]
+                            if len(copies) == len(places) and hit.function["vram"] in copies else None)
+        if decided[key] is None:
+            keep.append(hit)
+        elif decided[key] == hit.vram:
+            hit.placed = True
+            hit.notes.append(f"placed by the order of its {len(places)} copies in the donor and in the title")
+            keep.append(hit)
+            fixed += 1
+    return keep, fixed
+
+
+def ambiguous_sites(hits: list[Hit]) -> set[tuple[int, int]]:
+    """``(id(hit), site offset)`` of the sites where a target function says nothing.
+
+    One target function can be, masked, several functions of one donor at once (the getters of
+    two different variables; the same routine written for two devices).  At a site where those
+    donor functions refer to different things, the target's instruction would be given a
+    different name by each of them and at most one is right: none of them is a witness for the
+    address.  Sites where they all refer to the same thing (a shared callee) still count."""
+    groups: dict[tuple[str, int], list[Hit]] = defaultdict(list)
+    for hit in hits:
+        if hit.kind == "exact":
+            groups[(hit.donor, hit.vram)].append(hit)
+    out: set[tuple[int, int]] = set()
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        referred: dict[int, set[int]] = defaultdict(set)
+        for hit in group:
+            for site in hit.sites:
+                if site.get("offset") is not None:
+                    referred[site["offset"]].add(_key(hit, site)[1])
+        out.update((id(hit), site["offset"]) for hit in group for site in hit.sites
+                   if len(referred.get(site.get("offset"), ())) > 1)
+    return out
+
+
 def transfer(hits: list[Hit]) -> dict:
     """Derive target addresses of donor symbols and check them across all exact hits.
 
@@ -602,12 +712,15 @@ def transfer(hits: list[Hit]) -> dict:
     votes: dict[tuple[str, int], dict[int, list[Hit]]] = defaultdict(lambda: defaultdict(list))
     names: dict[tuple[str, int], str | None] = {}
     by_name: dict[str, dict[int, set]] = defaultdict(lambda: defaultdict(set))
+    ambiguous = ambiguous_sites(hits)
     for hit in hits:
         if hit.kind != "exact" or hit.template or hit.status != "candidate":
             continue
         for site in hit.sites:
             if site["donor_symbol"] is None and site["donor_address"] == site["target_address"]:
                 continue        # constant / hardware address, identical on both sides
+            if (id(hit), site.get("offset")) in ambiguous:
+                continue        # another function of the same donor names something else here
             key = _key(hit, site)
             taddr = (site["target_address"] - site["addend"]) & 0xFFFFFFFF
             if hit not in votes[key][taddr]:
@@ -652,7 +765,11 @@ def transfer(hits: list[Hit]) -> dict:
         (taddr, hs), = choices.items()
         call = any(s["kind"] in ("jal", "j") for h in hs for s in h.sites if _key(h, s) == key)
         symbols[key] = {"donor": key[0], "donor_address": key[1], "donor_symbol": names[key],
-                        "target_address": taddr, "hits": len({h.name for h in hs}), "call": call}
+                        "target_address": taddr, "hits": len({h.name for h in hs}), "call": call,
+                        "functions": sorted({h.name for h in hs}),
+                        # where each supporter stands: a supporter inside a unit's own bytes is that
+                        # unit, whatever the catalogue calls it (classify_pin ``span``)
+                        "supporters": sorted({(h.name, h.vram, h.size) for h in hs})}
         by_target[taddr].add(key)
     suspicious = []
     for taddr, keys in by_target.items():
@@ -742,6 +859,7 @@ class Job:
     unit: dict
     vram: int                        # target address of the unit start
     size: int                        # bytes compared (unit core size)
+    whole: bool = False              # a unit of several functions whose whole masked code stands there
 
 
 def plan(hits: list[Hit], image: bytes, vram_delta: int,
@@ -780,15 +898,27 @@ def plan(hits: list[Hit], image: bytes, vram_delta: int,
         code = strip_padding(image[offset:offset + unit["core_size"]]) if offset >= 0 else b""
         if len(code) == unit["core_size"] and signature(mask(code, start)[0]) == unit["unit_masked"]:
             done.add(key)
-            jobs.append(Job([hit], unit, start, unit["core_size"]))
+            jobs.append(Job([hit], unit, start, unit["core_size"], whole=True))
             continue
-        missing = []
+        missing, lost = [], []
         for other in unit["functions"]:
             o = offset + other["offset"]
             ocode = strip_padding(image[o:o + other["size"]]) if o >= 0 else b""
-            if len(ocode) != other["size"] or signature(mask(ocode, start + other["offset"])[0]) != other["masked"]:
+            omasked = mask(ocode, start + other["offset"])[0]
+            if len(ocode) != other["size"] or signature(omasked) != other["masked"]:
                 missing.append({"donor_function": other["name"], "expected_target_vram": f"0x{start + other['offset']:08X}",
                                 "size": other["size"]})
+                lost.append(only_lost_lo(mask(bytes.fromhex(other["bytes"]), other["vram"])[0], omasked, ocode)
+                            if len(ocode) == other["size"] and other.get("bytes") else None)
+        if missing and all(lost) and len(code) == unit["core_size"]:
+            # Every function of the unit stands there, and the ones that differ do so only in %lo
+            # halves the masking missed (as for a single near function above): the strict
+            # comparison of the rebuilt unit decides.  Not ``whole``: the masked code is not equal.
+            done.add(key)
+            hit.notes.append("unit differs from the donor only in %lo halves the masking missed: "
+                             + ", ".join(m["donor_function"] for m in missing))
+            jobs.append(Job([hit], unit, start, unit["core_size"]))
+            continue
         hit.status = "partial-unit"
         pkey = (hit.vram, unit["donor"], unit["source"])
         if pkey in done or hit.size < 16:      # tiny stubs hit inside many units: count, do not list
@@ -805,6 +935,124 @@ def plan(hits: list[Hit], image: bytes, vram_delta: int,
             if job and hit not in job.hits:
                 job.hits.append(hit)
     return jobs, partial
+
+
+def unit_definitions(jobs: list[Job], definitions: dict) -> dict:
+    """``definitions`` (where each donor function was found, see :func:`transfer`) with the
+    functions of every unit found whole.
+
+    A unit of several functions whose whole masked code stands in the target places each of its
+    functions, also the ones no catalogued target function matched by itself: a catalogue that
+    cuts a function short, or merges two, yields no hit for it, and the callers of that function
+    then waited for an address the unit found around it establishes."""
+    out = {key: set(places) for key, places in definitions.items()}
+    for job in jobs:
+        if job.whole:
+            for fn in job.unit["functions"]:
+                out.setdefault((job.unit["donor"], fn["vram"]), set()).add(job.vram + fn["offset"])
+    return out
+
+
+def unit_label(donor: str, source: str) -> str:
+    """``donor:unit`` for notes and pin origins; a unit kept outside the donor's root (generated
+    text, an absolute path) is named by its last two components, so no record names a machine."""
+    path = Path(str(source))
+    return f"{donor}:{'/'.join(path.parts[-2:]) if path.is_absolute() else path.as_posix()}"
+
+
+def data_defines(elf: Elf, bases: dict[str, int], donor_bases: dict[str, int]) -> list[tuple[str, int, int | None, str]]:
+    """``(name, target address, donor address or None, section)`` of every global symbol the
+    object defines outside ``.text`` in a section whose target base is in ``bases`` (the bases a
+    strict comparison was given: confirmed by the section's contents, or settled by a chain)."""
+    out = []
+    for symbol in elf.symbols:
+        if symbol.bind != 1 or not symbol.name or not 0 < symbol.section < len(elf.sections):
+            continue
+        section = elf.sections[symbol.section].name
+        if section == ".text" or section not in bases:
+            continue
+        donor_base = donor_bases.get(section)
+        out.append((symbol.name, bases[section] + symbol.value,
+                    None if donor_base is None else donor_base + symbol.value, section))
+    return out
+
+
+def verified_definitions(rows: list[dict], definitions: dict, verified: dict | None = None,
+                         defined_as: dict | None = None) -> int:
+    """Add to ``definitions`` what the units verified exact define; returns how many places are new.
+
+    A strictly verified unit is the strongest form of "the donor function of that name is
+    identical there": its rebuilt code compared equal with every address it uses established
+    independently.  The scan's definitions miss such a function when it was only a near hit (a
+    ``%lo`` half the masking lost) or had no hit of its own.  A unit that is only a common shape
+    (every function of it stands at several places) defines nothing.
+
+    Such a unit defines its global data as well as its functions: a global symbol in a section
+    the strict comparison was given a base for (confirmed by the section's contents, or settled
+    by a chain of sections) stands at that base plus its offset, and the units of the same donor
+    that refer to it find it under ``(donor, donor address)`` like a function.
+
+    ``verified`` (target address -> what verified units define there: ``kind`` function or data,
+    ``name``, ``size`` of a function, ``donor``, ``unit``) is the record a unit of *another*
+    donor is settled from (``classify_pin``): ``definitions`` is keyed by donor, and the same
+    library function verified from one donor's source was invisible to the units of every other.
+    ``defined_as`` keeps a sentence for each data definition (``(donor, donor address, target
+    address)``), for the row that uses it."""
+    added = 0
+    for row in rows:
+        unit = row.get("_unit")
+        if row.get("verdict") != EXACT_VERDICT or unit is None or row.get("template"):
+            continue
+        label = unit_label(unit["donor"], unit["source"])
+        found = [("function", fn["name"], row["target_vram"] + fn["offset"], fn["vram"], fn["size"], ".text")
+                 for fn in unit["functions"]]
+        found += [("data", name, taddr, daddr, 0, section) for name, taddr, daddr, section in row.get("_defines") or ()]
+        for kind, name, place, daddr, size, section in found:
+            if daddr is not None:
+                places = definitions.setdefault((unit["donor"], daddr), set())
+                if place not in places:
+                    places.add(place)
+                    added += 1
+                if kind == "data" and defined_as is not None:
+                    defined_as[(unit["donor"], daddr, place)] = (
+                        f"{name} is defined there by the verified unit {label}, whose {section} is at "
+                        f"0x{(row.get('_bases') or {}).get(section, place):08X}")
+            if verified is not None:
+                entry = {"kind": kind, "name": name, "size": size, "donor": unit["donor"], "unit": label,
+                         "section": section}
+                held = verified.setdefault(place, [])
+                if entry not in held:
+                    held.append(entry)
+                    added += 1
+    return added
+
+
+def same_function_code(dcode: bytes, dvram: int, tcode: bytes, tvram: int) -> bool:
+    """Whether donor code and target code of one length are the same function to the scan: equal
+    masked words (``mask``), and at the masked sites nothing that marks another function.  An
+    unpaired ``lui`` constant must be the same value (as in ``_align``), a fixed address (low
+    memory, a hardware register) must be the same address, and a jump or call inside the code
+    must land at the same offset."""
+    if not dcode or len(dcode) != len(tcode) or len(dcode) % 4:
+        return False
+    dmasked, dsites = mask(dcode, dvram)
+    tmasked, tsites = mask(tcode, tvram)
+    if dmasked != tmasked:
+        return False
+    there = {i: (kind, address) for i, kind, address in tsites}
+    for i, kind, daddr in dsites:
+        tkind, taddr = there.get(i, (None, None))
+        if tkind != kind:
+            return False
+        if kind == "lui":
+            if daddr != taddr and not (0x80000000 <= daddr < 0xC0000000 and 0x80000000 <= taddr < 0xC0000000):
+                return False
+        elif (fixed_address(daddr) or fixed_address(taddr)) and daddr != taddr:
+            return False
+        elif dvram <= daddr < dvram + len(dcode) or tvram <= taddr < tvram + len(tcode):
+            if daddr - dvram != taddr - tvram:
+                return False
+    return True
 
 
 def corroborated_sections(verdict, elf: Elf) -> dict[str, int]:
@@ -828,6 +1076,20 @@ def corroborated_sections(verdict, elf: Elf) -> dict[str, int]:
     return confirmed
 
 
+def confirm_sections(compare, elf: Elf, bases: dict[str, int]):
+    """(verdict, {section: address}) of a strict comparison whose assumed section addresses the unit's own
+    data confirms.  ``compare(bases) -> Verdict`` runs the strict comparison with the given section bases.
+    A base already given is never replaced; the rule and its thresholds are ``corroborated_sections``'s.
+    This is the one place a resolved C unit, a receipt being issued and a receipt being replayed all
+    apply it, so none of them can accept what another would not."""
+    verdict = compare(dict(bases))
+    confirmed = {name: address for name, address in corroborated_sections(verdict, elf).items()
+                 if name not in bases}
+    if not confirmed:
+        return verdict, {}
+    return compare({**bases, **confirmed}), confirmed
+
+
 def common_shape(hits) -> bool:
     """Whether a unit's place in the target is only a common shape: every one of its functions
     also stands at other addresses (a getter, a setter).  A unit of several functions is pinned
@@ -839,6 +1101,115 @@ def fixed_address(address: int) -> bool:
     """Low memory the boot code fills and the hardware registers: the same on every console, so a
     donor's name for one of them cannot belong to a different address in the target."""
     return 0x80000000 <= address < 0x80000400 or 0xA0000000 <= address < 0xC0000000
+
+
+_CORROBORATION = {"definition": "the donor function of that name is identical there",
+                  "fixed-address": "a fixed address, the same in the donor"}
+
+
+def classify_pin(donor: str, daddr: int | None, taddr: int, table: dict, definitions: dict,
+                 own: set[str], *, span: tuple[int, int] | None = None, name: str | None = None,
+                 verified: dict | None = None, same_code=None, same_data=None,
+                 same_function=None) -> tuple[str, str]:
+    """How a unit may use the target address ``taddr`` of one of its relocated symbols.
+
+    ``("declare", origin)``: independent of the unit's own bytes (``definition``: the donor
+    function of that name was found identical there, and nowhere else; ``fixed-address``: the
+    same fixed address in the donor; ``transfer: …``: aligned instructions of other target
+    functions agree on it).  ``("self", "")``: only instructions inside this unit support it, so
+    the retail bytes under comparison would establish the address that makes them compare equal;
+    never a pin.  ``("unchecked", why)``: nothing transfers it, or the donor function stands at
+    several places and only this unit's instruction picks one.  ``("conflict", message)``: the
+    transfer table places it elsewhere.
+
+    ``own`` names the unit's functions; ``span`` (``[start, end)`` of the bytes the unit is
+    compared over) also makes every supporter or definition inside those bytes the unit itself,
+    whatever the catalogue calls it (a catalogue that splits one of the unit's functions in two
+    would otherwise let the tail vote for the address its own instruction reads).
+
+    ``verified`` (``verified_definitions``: target address -> what units verified exact define
+    there), with the pin's ``name``, settles a pin from the units of *other* donors, where the
+    transfer table and ``definitions`` (both keyed by donor) say nothing.  The origin is
+    ``definition: …`` when a verified unit that is no common shape defines something starting
+    exactly at ``taddr``, outside this unit's bytes, and either it has the pin's name (a name a
+    survey made up, ``func_…``/``D_…``, only within one donor), or it is a function and this
+    donor's own code at ``daddr`` is the same over that function's extent
+    (``same_code(daddr, taddr, size)``, see ``same_function_code``).  It never applies when this
+    donor's function is known to stand at another place too: the unit's instruction would pick."""
+    def inside(address: int, size: int = 1) -> bool:
+        return span is not None and address < span[1] and span[0] < address + max(1, size)
+
+    def by_verified() -> tuple[str, str] | None:
+        if not verified or name is None or inside(taddr):
+            return None
+        if daddr is not None and set(definitions.get((donor, daddr), ())) - {taddr}:
+            return None                             # this donor's function stands elsewhere too: a shape
+        for entry in verified.get(taddr, ()):
+            if entry["name"] == name and (entry["donor"] == donor or not AUTO_NAME.match(name)):
+                return "declare", f"definition: the verified unit {entry['unit']} defines {name} there (the same name)"
+            if entry["kind"] == "function" and daddr is not None and same_code is not None \
+                    and same_code(daddr, taddr, entry["size"]):
+                return "declare", (f"definition: the verified unit {entry['unit']} places {entry['name']} there, and "
+                                   f"this donor's code for {name} is the same over its {entry['size']} bytes")
+        return None
+
+    def by_catalogue() -> tuple[str, str] | None:
+        # ``same_function(daddr, taddr)``: the size of the catalogued function that starts at the pin when this
+        # donor's code at its address of the symbol is that function, and no other catalogued function is.
+        # For a function whose address is taken (an exception vector's target) and that no donor unit holds.
+        if same_function is None or daddr is None or name is None or inside(taddr):
+            return None
+        size = same_function(daddr, taddr)
+        if size:
+            return "declare", (f"definition: this donor's code for {name} is the {size}-byte function catalogued "
+                               f"there, and no other catalogued function")
+        return None
+
+    def by_content() -> tuple[str, str] | None:
+        # ``same_data(daddr, taddr)``: how many bytes of this donor's datum stand, unchanged, at the pin
+        # (0 when too few or too plain to tell).  Bytes the unit's instructions never looked at.
+        if same_data is None or daddr is None or name is None or inside(taddr):
+            return None
+        if daddr == taddr and fixed_address(daddr):
+            return "declare", "fixed-address"
+        length = same_data(daddr, taddr)
+        if length:
+            return "declare", f"definition: this donor's {length} bytes of {name} stand at that address"
+        return None
+
+    def by_definition() -> tuple[str, str] | None:
+        if daddr is None or taddr not in definitions.get((donor, daddr), ()):
+            return None
+        found = set(definitions[(donor, daddr)])
+        if inside(taddr):
+            return "self", ""                       # the definition found is this unit's own code
+        if found != {taddr}:
+            return "unchecked", f"the donor function stands at {len(found)} places; only this unit's code picks one"
+        return "declare", "definition"
+
+    item = table.get((donor, daddr)) if daddr is not None else None
+    if item is None and by_definition() is not None:
+        return by_definition()
+    if item is None and daddr is not None and daddr == taddr and fixed_address(daddr):
+        return "declare", "fixed-address"
+    if item is None:
+        return by_verified() or by_content() or by_catalogue() or ("unchecked", "")
+    if item["target_address"] != taddr:
+        return "conflict", f"transferred 0x{item['target_address']:08X} but this unit needs 0x{taddr:08X}"
+    if "functions" not in item:                      # a transfer table written before supporters were kept
+        return "declare", f"transfer: {item.get('hits', 0)} function(s), supporters not recorded"
+    if span is not None and item.get("supporters") is not None:
+        support = sorted({name for name, vram, size in item["supporters"]
+                          if name not in own and not inside(vram, size)})
+    else:
+        support = sorted(set(item["functions"]) - set(own))
+    if not support:
+        # Every vote for the address is the unit's own instruction.  The votes establish nothing,
+        # but the donor function of that name found identical at the address (and nowhere else,
+        # and outside the unit's bytes) does: that is evidence the unit's instructions took no
+        # part in, exactly as when no vote was recorded at all.
+        return by_definition() or by_verified() or by_content() or by_catalogue() or ("self", "")
+    return "declare", f"transfer: {len(support)} other function(s), e.g. {support[0]}"
 
 
 def verify_job(job: Job, index: Index, target, transfer_result: dict, function_starts: set[int] | None,
@@ -873,47 +1244,164 @@ def verify_job(job: Job, index: Index, target, transfer_result: dict, function_s
     row["template"] = common_shape(job.hits)
     table = {} if row["template"] else transfer_result["symbols"]
     definitions = transfer_result.get("definitions") or {}
+    verified = transfer_result.get("verified") or {}
+    defined_as = transfer_result.get("defined_as") or {}
     declared = symmod.SymbolMap()
+    own = {hit.name for hit in job.hits}
+    origin = row["pin_origin"] = {}
+
+    def same_code(daddr: int, taddr: int, length: int) -> bool:
+        # this donor's own bytes at its address of the symbol against the target's at the pin
+        doff, toff_ = daddr - donor["delta"], target.vram_to_rom(taddr)
+        if doff < 0 or toff_ < 0:
+            return False
+        return same_function_code(dimage[doff:doff + length], daddr, target.rom[toff_:toff_ + length], taddr)
+
+    def same_data(daddr: int, taddr: int) -> int:
+        # a named datum of the donor found unchanged in the target: the longest of 64, 32 or 16 equal bytes
+        # with at least DATA_NONZERO of them non-zero; never inside code the title's catalogue lists
+        doff, toff_ = daddr - donor["delta"], target.vram_to_rom(taddr)
+        if doff < 0 or toff_ < 0 or (function_starts and taddr in function_starts):
+            return 0
+        for length in (64, 32, 16):
+            there, here = dimage[doff:doff + length], target.rom[toff_:toff_ + length]
+            if len(there) == length and there == here and sum(1 for byte in here if byte) >= DATA_NONZERO:
+                return length
+        return 0
+
+    sizes = transfer_result.get("function_sizes") or {}
+
+    def same_function(daddr: int, taddr: int) -> int:
+        size = sizes.get(taddr, 0)
+        if size < SAME_FUNCTION_MIN or not same_code(daddr, taddr, size):
+            return 0
+        others = [start for start, other in sizes.items() if other == size and start != taddr]
+        return 0 if any(same_code(daddr, start, size) for start in others) else size
+
     for name, taddr in tsyms.items():
-        daddr = dsyms.get(name)
-        item = table.get((unit["donor"], daddr)) if daddr is not None else None
-        if item is None and daddr is not None and taddr in definitions.get((unit["donor"], daddr), ()):
-            # the function this name belongs to was itself found, identical, at that address
+        decision, why = classify_pin(unit["donor"], dsyms.get(name), taddr, table, definitions, own,
+                                     span=(job.vram, job.vram + job.size), name=name, verified=verified,
+                                     same_code=same_code, same_data=same_data, same_function=same_function)
+        if decision == "declare":
             declared[name] = taddr
             row["transferred"][name] = f"0x{taddr:08X}"
-            row.setdefault("corroborated", {})[name] = "the donor function of that name is identical there"
-            continue
-        if item is None and daddr is not None and daddr == taddr and fixed_address(daddr):
-            declared[name] = taddr                          # the same fixed address on both sides
+            origin[name] = why
+            if why in _CORROBORATION:
+                row.setdefault("corroborated", {})[name] = defined_as.get(
+                    (unit["donor"], dsyms.get(name), taddr), _CORROBORATION[why])
+            elif why.startswith("definition: "):
+                row.setdefault("corroborated", {})[name] = why[len("definition: "):]
+        elif decision == "conflict":
+            row["conflicts"].append(f"{name}: {why}")
+        elif (transfer_result.get("stated") or {}).get(name) == taddr:
+            # The project's own symbol file gives this name this address: a declaration somebody reviewed
+            # (``donors/awaiting_symbols.txt`` asks for exactly that), not the bytes under test speaking
+            # for themselves.  Recorded as ``declared``; a receipt replay checks the map still holds it.
+            declared[name] = taddr
             row["transferred"][name] = f"0x{taddr:08X}"
-            row.setdefault("corroborated", {})[name] = "a fixed address, the same in the donor"
-            continue
-        if item is None:
-            # Keep target-derived values as diagnostics only.  Supplying them to strict_compare
+            origin[name] = "declared: the project's symbol file gives this name this address"
+        else:
+            # Target-derived values are kept as diagnostics only.  Supplying them to strict_compare
             # would make the bytes under test their own authority and could prove a wrong symbol.
             row.setdefault("derived_unchecked", {})[name] = f"0x{taddr:08X}"
-            continue
-        if item["target_address"] != taddr:
-            row["conflicts"].append(f"{name}: transferred 0x{item['target_address']:08X} but this unit needs 0x{taddr:08X}")
-            continue
-        declared[name] = taddr
-        row["transferred"][name] = f"0x{taddr:08X}"
+            if decision == "self":
+                row.setdefault("self_derived", {})[name] = f"0x{taddr:08X}"
+    # A name only the unit's data refers to (a table of pointers to other units' objects): no instruction of
+    # the unit gives its address, so nothing above could settle it, and the data section then cannot be
+    # compared at all.  A unit verified exact that defines an object of that name, at one address, does.
+    if verified:
+        for symbol in elf.symbols:
+            if symbol.section != 0 or not symbol.name or symbol.name in declared or symbol.name in tsyms \
+                    or AUTO_NAME.match(symbol.name):
+                continue
+            places = {address: entry for address, entries in verified.items() for entry in entries
+                      if entry["name"] == symbol.name}
+            if len(places) == 1:
+                (address, entry), = places.items()
+                if not (job.vram <= address < job.vram + job.size):
+                    declared[symbol.name] = address
+                    row["transferred"][symbol.name] = f"0x{address:08X}"
+                    origin[symbol.name] = (f"definition: the verified unit {entry['unit']} defines {symbol.name} "
+                                           f"there (the same name)")
+    # ... or, when no verified unit has it under that name (two donors name one object differently): the
+    # word standing at the reference in the unit's own data, at the address the unit's code gives that data,
+    # when that word is exactly where a verified unit defines an object.  The address comes from the image
+    # and the claim it must meet from another unit's verification, not from this unit's instructions.
+    if verified:
+        for section_name, base in tbases.items():
+            section = cmp.find_section(elf, section_name)
+            if section is None or section_name == ".text":
+                continue
+            for offset, rtype, sidx, addend in elf.relocations(section):
+                symbol = elf.symbols[sidx]
+                if rtype != 2 or symbol.section != 0 or not symbol.name or symbol.name in declared \
+                        or symbol.name in tsyms:                 # R_MIPS_32 to a name nothing has placed
+                    continue
+                at = target.vram_to_rom(base + offset)
+                if at < 0 or at + 4 > len(target.rom):
+                    continue
+                if addend is None:                           # REL: the addend is the word in the object
+                    addend = int.from_bytes(section.data[offset:offset + 4], "big") if offset + 4 <= len(section.data) else 0
+                address = (int.from_bytes(target.rom[at:at + 4], "big") - addend) & 0xFFFFFFFF
+                found = [entry for entry in verified.get(address, ()) if entry["kind"] == "data"]
+                if found and not (job.vram <= address < job.vram + job.size):
+                    declared[symbol.name] = address
+                    row["transferred"][symbol.name] = f"0x{address:08X}"
+                    origin[symbol.name] = (f"definition: the unit's {section_name} holds 0x{address:08X} where it "
+                                           f"refers to {symbol.name}, and the verified unit {found[0]['unit']} "
+                                           f"defines {found[0]['name']} there")
     for name, base in tbases.items():
         # a section of the unit itself: its base follows from the donor base and the aligned sites
         row["derived_sections"][name] = f"0x{base:08X}"
+    # A symbol no instruction of the unit refers to (a pointer in its initialized data) has no
+    # address read from the unit's code at all.  A verified unit that defines that name gives it
+    # one, and the comparison of the section holding the pointer then tests it against the image.
+    for symbol in elf.symbols:
+        if symbol.bind != 1 or not symbol.name or symbol.section != 0 or symbol.name in tsyms \
+                or symbol.name in declared:
+            continue
+        places = {place: entry for place, entries in verified.items() for entry in entries
+                  if entry["name"] == symbol.name and (entry["donor"] == unit["donor"] or not AUTO_NAME.match(symbol.name))
+                  and not job.vram <= place < job.vram + job.size}
+        if len(places) == 1:
+            (place, entry), = places.items()
+            declared[symbol.name] = place
+            row["transferred"][symbol.name] = f"0x{place:08X}"
+            origin[symbol.name] = (f"definition: the verified unit {entry['unit']} defines {symbol.name} there "
+                                   f"(the same name); no instruction of this unit reads the address")
+            row.setdefault("corroborated", {})[symbol.name] = origin[symbol.name][len("definition: "):]
     if row["conflicts"]:
         row["verdict"] = "needs-review"
         return row
-    # Target-inferred section bases are likewise useful evidence but never proof.  A later pass
-    # may promote independently transferred/project-declared bases; this pass must fail closed.
-    verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared, {},
+    # Target-inferred section bases are likewise useful evidence but never proof: only a base the
+    # section's own contents confirm, or one a chain of sections settled (``settle_sections``, on a
+    # later pass), is given to the comparison.  Anything else stays an assumption (fail closed).
+    key = (unit["donor"], unit["source"], job.vram)
+    chained = {name: item for name, item in ((transfer_result.get("settled") or {}).get(key) or {}).items()
+               if tbases.get(name) == item["base"] and cmp.find_section(elf, name) is not None
+               and cmp.find_section(elf, name).size == item["size"]}
+    given = {name: item["base"] for name, item in chained.items()}
+    # A section base the project states for this unit (``n64dk_section_<unit address>_<section>`` in its
+    # symbol file, which ``donors/awaiting_symbols.txt`` spells out): a reviewed declaration, like a symbol's.
+    # Only a base the unit's own instructions also give is taken, and the comparison still decides.
+    stated_bases = {name: base for name, base in tbases.items()
+                    if name not in given and cmp.find_section(elf, name) is not None
+                    and (transfer_result.get("stated") or {}).get(stated_section_name(job.vram, name)) == base}
+    given.update(stated_bases)
+    verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared, given,
                              None, function_starts)
-    confirmed = corroborated_sections(verdict, elf)
+    confirmed = {name: base for name, base in corroborated_sections(verdict, elf).items() if name not in given}
     if confirmed:
-        verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared, confirmed,
-                                 None, function_starts)
+        verdict = strict_compare(elf, target.rom, target.vram_to_rom, job.vram, job.size, declared,
+                                 {**given, **confirmed}, None, function_starts)
         for name, base in confirmed.items():
             row.setdefault("corroborated", {})[name] = f"its {len(cmp.find_section(elf, name).data)} bytes are at 0x{base:08X}"
+            origin[f"section:{name}"] = "section-content"      # derived from code, confirmed by its own data bytes
+    for name, item in chained.items():
+        row.setdefault("corroborated", {})[name] = item["origin"][len(CHAIN_ORIGIN) + 2:]
+        origin[f"section:{name}"] = item["origin"]             # derived from code, confirmed by its neighbours
+    for name in stated_bases:
+        origin[f"section:{name}"] = "declared: the project's symbol file states this unit's section base"
     row["strict"] = verdict.as_dict()
     unverified = [s["section"] for s in verdict.sections if s.get("status") == "unverified"]
     if verdict.verdict == "mismatch" or not verdict.text_equal:
@@ -946,6 +1434,9 @@ def verify_job(job: Job, index: Index, target, transfer_result: dict, function_s
         row["cause"] = _cause(row, elf, dcode, unit["vram"])
     row["_elf_spec"] = (spec, declared, dict(tbases), source)
     row["_object"] = elf
+    row["_unit"] = unit
+    row["_bases"] = {**given, **confirmed}                     # the bases the comparison was given
+    row["_defines"] = data_defines(elf, row["_bases"], dbases)
     return row
 
 
@@ -1012,7 +1503,9 @@ def write_outputs(out_dir: Path, rows: list[dict], index: Index, target, report:
                  "# add to the symbol file (sections: to the unit's manifest row), run again.", ""]
         for row in sorted(waiting, key=lambda r: r["target_vram"]):
             lines.append(f"# 0x{row['target_vram']:08X} {row['donor']}:{row['donor_unit']}")
-            lines.extend(f"{name} = {address};" if not name.startswith(".") else f"#   section {name} at {address}"
+            lines.extend(f"{name} = {address};" if not name.startswith(".") else
+                         f"#   section {name} at {address}; to state it: "
+                         f"{stated_section_name(row['target_vram'], name)} = {address};"
                          for name, address in sorted((row.get("awaiting") or {}).items()))
         (out_dir / "awaiting_symbols.txt").write_text("\n".join(lines) + "\n")
     manifests: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -1058,6 +1551,16 @@ def write_outputs(out_dir: Path, rows: list[dict], index: Index, target, report:
 
 
 MAX_ALTERNATIVES = 8            # distinct donor units built for one place before giving up
+MAX_DEFINITION_ROUNDS = 8       # passes in which units verified exact settle the units calling them
+MAX_CHAIN_TRIES = 4             # whole solutions tried while a section chain fails among the selected rows
+
+
+def _progress(row: dict) -> tuple:
+    """How far a row got: exact before waiting before anything else, then fewer addresses waited
+    for, then more sections compared equal."""
+    rank = {EXACT_VERDICT: 2, ASSUMED_VERDICT: 1}.get(row.get("verdict"), 0)
+    equal = sum(1 for state in (row.get("strict") or {}).get("sections", []) if state.get("status") == "equal")
+    return rank, -len(row.get("awaiting") or {}), equal
 _LIBRARY_DONOR = re.compile(r"^t[0-9a-f]{16}_")
 
 
@@ -1070,6 +1573,22 @@ def alternative_order(job) -> tuple:
     then by name, so the order does not depend on how the index was built."""
     unit = job.unit
     return (bool(_LIBRARY_DONOR.match(unit["donor"])), len(unit["functions"]) != 1, unit["donor"], unit["source"])
+
+
+def places(jobs: list[Job]) -> dict[tuple[int, int], list[Job]]:
+    """The jobs grouped by place (unit start and compared size), each group in the order its
+    alternatives are tried.
+
+    Units of different sizes that begin at one address are different places, not alternatives of
+    each other: an empty function the compiler left at the head of a unit is also, by itself, a
+    4-byte unit of some donor, and stopping at that one (exact at once) never tried the unit
+    that begins there.  ``select_rows`` keeps the largest exact row of those that overlap."""
+    out: dict[tuple[int, int], list[Job]] = defaultdict(list)
+    for job in jobs:
+        out[(job.vram, job.size)].append(job)
+    for alts in out.values():
+        alts.sort(key=alternative_order)
+    return dict(out)
 
 
 def distinct_alternatives(alts: list) -> list:
@@ -1090,6 +1609,8 @@ def distinct_alternatives(alts: list) -> list:
 
 RODATA = (".rodata", ".rdata")
 SETTLE_MIN_PIECES, SETTLE_MIN_BYTES, SETTLE_MIN_NONZERO = 2, 16, 8
+CHAIN_ORIGIN = "section-chain"      # pin origin of a section base settled by settle_sections
+CHAIN_DATA, CHAIN_BSS = (".data",), (".bss",)
 
 
 def rodata_chains(pieces: list[dict], rom: bytes, vram_to_rom) -> list[list[dict]]:
@@ -1205,19 +1726,226 @@ def settle_rodata(rows: list[dict], target, function_starts: set[int] | None) ->
     return report
 
 
-def select_rows(rows: list[dict]) -> list[dict]:
-    """Keep non-overlapping exact rows (largest first); overlapped exact rows become ``superseded``."""
+def selected_rows(rows: list[dict]) -> list[dict]:
+    """The rows ``select_rows`` keeps: non-overlapping, every exact row before any waiting one,
+    the largest first.  Changes nothing."""
     taken: list[tuple[int, int]] = []
+    kept = []
     for wanted in (EXACT_VERDICT, ASSUMED_VERDICT):          # every exact row before any assumed one
         chosen = sorted((r for r in rows if r["verdict"] == wanted), key=lambda r: (-r["size"], r["target_vram"]))
         for row in chosen:
             lo, hi = row["target_vram"], row["target_vram"] + row["size"]
-            if any(a < hi and lo < b for a, b in taken):
-                row["verdict"] = "superseded"
-                row["notes"].append("overlaps a larger exact transplant")
-            else:
+            if not any(a < hi and lo < b for a, b in taken):
                 taken.append((lo, hi))
+                kept.append(row)
+    return kept
+
+
+def select_rows(rows: list[dict]) -> list[dict]:
+    """Keep non-overlapping exact rows (largest first); overlapped exact rows become ``superseded``."""
+    kept = {id(row) for row in selected_rows(rows)}
+    for row in rows:
+        if row["verdict"] in (EXACT_VERDICT, ASSUMED_VERDICT) and id(row) not in kept:
+            row["verdict"] = "superseded"
+            row["notes"].append("overlaps a larger exact transplant")
     return rows
+
+
+def section_pieces(units: list[dict]) -> list[dict]:
+    """The ``.data`` and ``.bss`` sections of ``units`` as pieces for ``section_chains``.
+
+    A unit is ``{"key", "text": (vram, size), "elf", "bases", "equal"}``: its object, the section
+    addresses its own code points to (``bases``: derived from the target's instructions at the
+    unit's relocation sites) and the names of the sections whose contents the strict comparison
+    found equal at that address (``equal``).  A ``.data`` section is a piece only with equal
+    contents; ``.bss`` has none.  The units must not overlap in the code they are compared over
+    (rows kept by ``selected_rows``; the manifest rows of a finished run): two of them cannot own
+    one address, so where two claim the same one neither claim is a piece."""
+    pieces = []
+    for unit in units:
+        for name in CHAIN_DATA + CHAIN_BSS:
+            section, base = unit["elf"].section(name), unit["bases"].get(name)
+            if section is None or not section.size or base is None:
+                continue
+            if name in CHAIN_DATA and name not in unit["equal"]:
+                continue
+            pieces.append({"address": base, "size": section.size, "align": section.align, "name": name,
+                           "kind": "data" if name in CHAIN_DATA else "bss", "key": unit["key"], "text": unit["text"]})
+    claims = Counter((piece["kind"], piece["address"]) for piece in pieces)
+    return [piece for piece in pieces if claims[(piece["kind"], piece["address"])] == 1]
+
+
+def section_chains(pieces: list[dict], rom: bytes, vram_to_rom) -> list[list[dict]]:
+    """The accepted chains of ``.data`` and of ``.bss`` pieces (``section_pieces``).
+
+    What a chain is, is ``rodata_chains``'s rule: each piece starts exactly where the previous
+    one ends, rounded up to its own alignment.  Each address was read from a different unit's
+    code; that they abut at the sizes and alignments the units were compiled with, which no
+    single derivation implies, is what a chain adds.
+
+    ``.data``: the thresholds of read-only data (at least SETTLE_MIN_PIECES pieces,
+    SETTLE_MIN_BYTES bytes and SETTLE_MIN_NONZERO non-zero bytes in the image over the chain),
+    every piece's contents equal to the image, the bytes between two pieces zero.
+
+    ``.bss`` holds no bytes in the image, so nothing is compared and the abutting addresses are
+    all the evidence there is.  Accepted with at least SETTLE_MIN_PIECES pieces and
+    SETTLE_MIN_BYTES bytes, and only where the pieces follow each other in the order of their
+    units' code (each unit's code begins at or after the end of the previous one's): a linker
+    lays the sections of one kind out in the order of the objects, so sections that abut out of
+    that order are a coincidence, not a layout.  (Measured on the title that prompted the rule:
+    eleven units' ``.bss`` in three chains of 6, 3 and 2 pieces, none out of order.)
+
+    A chain confirms nothing by itself: ``settle_sections`` gives a waiting unit the base and
+    the strict comparison decides."""
+    def shifted(piece: dict, origin: int) -> dict:
+        return {**piece, "address": piece["address"] - origin, "_piece": piece}
+
+    def unshift(origin: int):
+        return lambda address: vram_to_rom(address + origin)
+
+    def better(found: list[list[dict]], chain: list[dict]) -> None:
+        # one piece belongs to one chain: the longest found for it under any origin
+        members = {id(p) for p in chain}
+        rivals = [c for c in found if members & {id(p) for p in c}]
+        if all(len(chain) > len(c) for c in rivals):
+            found[:] = [c for c in found if c not in rivals] + [chain]
+
+    # The sections of one kind were laid out from the start of their segment, which need not be a multiple of
+    # the largest alignment (a library linked in one piece and placed whole: every .data of the title that
+    # prompted this is at 8 modulo 16).  The rule is applied with each origin a piece's address allows; under
+    # origin 0 it is the rule as written.
+    widest = max((max(1, p["align"]) for p in pieces), default=1)
+    origins = sorted({p["address"] % widest for p in pieces} | {0})
+    accepted: list[list[dict]] = []
+    for origin in origins:
+        data = sorted((shifted(p, origin) for p in pieces if p["kind"] == "data"), key=lambda p: p["address"])
+        for chain in rodata_chains(data, rom, unshift(origin)):
+            start, end = chain[0]["address"] + origin, chain[-1]["address"] + chain[-1]["size"] + origin
+            body = rom[vram_to_rom(start):vram_to_rom(end)]
+            if len(chain) >= SETTLE_MIN_PIECES and len(body) >= SETTLE_MIN_BYTES and \
+                    sum(1 for byte in body if byte) >= SETTLE_MIN_NONZERO:
+                better(accepted, [p["_piece"] for p in chain])
+        chains: list[list[dict]] = []
+        for piece in sorted((p for p in pieces if p["kind"] == "bss"), key=lambda p: p["address"]):
+            if chains:
+                last = chains[-1][-1]
+                end = last["address"] + last["size"] - origin
+                align = max(1, piece["align"])
+                if piece["address"] - origin == (end + align - 1) // align * align and \
+                        piece["text"][0] >= last["text"][0] + last["text"][1]:
+                    chains[-1].append(piece)
+                    continue
+            chains.append([piece])
+        for chain in chains:
+            if len(chain) >= SETTLE_MIN_PIECES and \
+                    chain[-1]["address"] + chain[-1]["size"] - chain[0]["address"] >= SETTLE_MIN_BYTES:
+                better(accepted, chain)
+    return accepted
+
+
+def _chain_units(rows: list[dict]) -> list[dict]:
+    units = []
+    for row in rows:
+        if row.get("_object") is None or "_elf_spec" not in row or row["verdict"] not in (EXACT_VERDICT, ASSUMED_VERDICT):
+            continue
+        bases = row["_elf_spec"][2]
+        equal = {state["section"] for state in (row.get("strict") or {}).get("sections", [])
+                 if state.get("status") == "equal" and state.get("compared") == state.get("size")
+                 and state.get("base") is not None and int(state["base"], 16) == bases.get(state["section"])}
+        units.append({"key": (row["donor"], row["donor_unit"], row["target_vram"]),
+                      "text": (row["target_vram"], row["size"]), "elf": row["_object"], "bases": bases, "equal": equal})
+    return units
+
+
+def chain_origin(piece: dict) -> str:
+    if piece["kind"] == "bss":
+        return (f"{CHAIN_ORIGIN}: its {piece['name']} abuts the {piece['name']} of other units end to end, each at "
+                "the address its own unit's code points to, at the compiled sizes and in the order of the units' "
+                "code (it holds no bytes to compare)")
+    return (f"{CHAIN_ORIGIN}: its {piece['name']} lies end to end with the {piece['name']} of other units, each at "
+            "the address its own unit's code points to and equal to the image there")
+
+
+def settle_sections(rows: list[dict], target, settled: dict, banned: set | None = None) -> list[tuple]:
+    """Record, for the units whose ``.data`` or ``.bss`` stands in an accepted chain, the base the
+    chain settles (``settled``: unit key -> section -> ``{"base", "size", "origin"}``); returns the
+    keys recorded now.
+
+    The pieces are the sections of the rows ``selected_rows`` keeps, verified or still waiting.
+    Nothing is promoted here: a unit is compared again with the base given (``verify_job``), and
+    is exact only when that comparison is, with nothing left assumed.  A base given this way has
+    the origin ``section-chain``, apart from ``section-content`` (confirmed by the section's own
+    bytes), so every unit that rests on a chain can be listed.  ``banned`` names ``(key,
+    section)`` pairs not to settle (a chain that did not hold once the rows were selected)."""
+    kept = selected_rows(rows)
+    # A waiting unit of several functions loses its place to the smaller exact rows of the same code (its
+    # functions verified one by one from another donor).  Its sections are still its own, and they are what
+    # a chain needs: such a unit contributes pieces too, when every kept row it overlaps is exact and lies
+    # inside it.  Settled, it is the larger exact row and takes the place.
+    spans = [(row["target_vram"], row["target_vram"] + row["size"], row) for row in kept]
+    for row in rows:
+        if row["verdict"] != ASSUMED_VERDICT or any(row is other for _a, _b, other in spans):
+            continue
+        lo, hi = row["target_vram"], row["target_vram"] + row["size"]
+        over = [(a, b, other) for a, b, other in spans if a < hi and lo < b]
+        if over and all(lo <= a and b <= hi and other["verdict"] == EXACT_VERDICT for a, b, other in over):
+            kept = kept + [row]
+    pieces = section_pieces(_chain_units(kept))
+    recorded = []
+    for chain in section_chains(pieces, target.rom, target.vram_to_rom):
+        for piece in chain:
+            if (piece["key"], piece["name"]) in (banned or ()):
+                continue
+            held = settled.setdefault(piece["key"], {})
+            if held.get(piece["name"], {}).get("base") != piece["address"]:
+                held[piece["name"]] = {"base": piece["address"], "size": piece["size"], "origin": chain_origin(piece)}
+                recorded.append(piece["key"])
+    return recorded
+
+
+def chain_report(rows: list[dict], target) -> tuple[list[dict], set[tuple]]:
+    """The accepted chains over the final rows, for the report, and the ``(key, section)`` pairs
+    of rows that are exact on a chain base no accepted chain holds any more."""
+    by_key = {(row["donor"], row["donor_unit"], row["target_vram"]): row for row in rows
+              if row["verdict"] in (EXACT_VERDICT, ASSUMED_VERDICT)}
+    chains = section_chains(section_pieces(_chain_units(list(by_key.values()))), target.rom, target.vram_to_rom)
+    held = {(piece["key"], piece["name"]): piece["address"] for chain in chains for piece in chain}
+    broken = set()
+    for key, row in by_key.items():
+        for name, origin in (row.get("pin_origin") or {}).items():
+            if name.startswith("section:") and str(origin).startswith(CHAIN_ORIGIN) and row["verdict"] == EXACT_VERDICT:
+                section = name[len("section:"):]
+                if held.get((key, section)) != (row.get("_bases") or {}).get(section):
+                    broken.add((key, section))
+    listing = [{"section": chain[0]["name"], "start": f"0x{chain[0]['address']:08X}",
+                "bytes": chain[-1]["address"] + chain[-1]["size"] - chain[0]["address"],
+                "units": [{"unit": unit_label(piece["key"][0], piece["key"][1]), "target_vram": f"0x{piece['key'][2]:08X}",
+                           "address": f"0x{piece['address']:08X}", "size": piece["size"],
+                           "verdict": by_key[piece["key"]]["verdict"],
+                           "rests_on_it": str((by_key[piece["key"]].get("pin_origin") or {}).get(
+                               f"section:{piece['name']}", "")).startswith(CHAIN_ORIGIN)}
+                          for piece in chain]} for chain in chains]
+    return listing, broken
+
+
+def functions_inside(vram: int, size: int, functions: list[tuple[str, int, int]], image: bytes,
+                     vram_delta: int) -> list[int]:
+    """Starts of the catalogued functions that lie wholly in the compared bytes ``[vram, vram + size)``.
+
+    A unit is compared as a whole, so a catalogued function inside it is reproduced whether or
+    not it matched a donor function by itself (a catalogue that cuts a function of the unit in
+    two gives no hit for either part).  A function may run past the end of the compared bytes
+    only over zeros (the unit's alignment padding, which the comparison leaves out); one that
+    holds other bytes there is not reproduced by this unit."""
+    out = []
+    for _name, start, length in functions:
+        if not vram <= start < vram + size:
+            continue
+        end = start + length
+        tail = image[vram + size - vram_delta:end - vram_delta] if end > vram + size else b""
+        if not any(tail):
+            out.append(start)
+    return sorted(out)
 
 
 _STATUS_ORDER = ("candidate", "partial-unit", "needs-review", "local-inconsistent")
@@ -1235,6 +1963,11 @@ def _best_status(hits: list[Hit]) -> str:
     return min((h.status for h in hits), key=lambda s: _STATUS_ORDER.index(s) if s in _STATUS_ORDER else 99)
 
 
+def stated_section_name(vram: int, section: str) -> str:
+    """The symbol-file name under which a project states the base of a donor unit's section."""
+    return f"n64dk_section_{vram:08X}_{section.strip('.')}"
+
+
 def manifest_declared_addresses(paths) -> set[int]:
     """Addresses a project declares in manifest flags (``--symbol=``, ``--section-base=``)."""
     out = set()
@@ -1248,12 +1981,13 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         skip: list[tuple[int, int]] | None = None, out_dir: Path | None = None, jobs: int = 4,
         toolchain_root: Path | None = None, verify: bool = True, near_max: int = 2,
         target_symbols: symmod.SymbolMap | None = None, truth_addresses: set[int] | None = None,
-        other_starts: set[int] | None = None) -> dict:
+        other_starts: set[int] | None = None, rodata_settlement: bool = True) -> dict:
     """Scan, transfer, transplant and verify; return the report dict (and write outputs).
 
     ``other_starts`` are the function starts of the title's other images.  A call out of this
     image into one of them lands on a function start too; without them every unit that calls
-    across images was refused."""
+    across images was refused.  ``rodata_settlement`` false leaves rows that wait for their
+    read-only data's address waiting (decompile-run ablation switch): it can only promote fewer."""
     t0 = time.time()
     skip = sorted(skip or [])
     def skipped(vram, size):
@@ -1261,19 +1995,21 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
     todo = [f for f in functions if not skipped(f[1], f[2])]
     hits = scan(target.rom, target.delta, todo, index, near_max)
     placed_by_order = corroborate(hits, functions, source_order(index))
+    hits, placed_copies = pair_copies(hits, index)
+    placed_by_order += placed_copies
     xfer = transfer(hits)
     starts = {v for _n, v, _s in functions}
     jobs_list, partial = plan(hits, target.rom, target.delta, starts)
+    xfer["definitions"] = unit_definitions(jobs_list, xfer.get("definitions") or {})
+    xfer["function_sizes"] = {vram: size for _name, vram, size in functions}
+    xfer["stated"] = dict(target_symbols or {})
     t_scan = time.time() - t0
     rows: list[dict] = []
     settled = None
+    section_chain_list: list[dict] = []
     if verify and jobs_list:
-        # one job per target unit address: try donors in order until one is exact
-        by_addr: dict[int, list[Job]] = defaultdict(list)
-        for job in jobs_list:
-            by_addr[job.vram].append(job)
-        for alts in by_addr.values():
-            alts.sort(key=alternative_order)
+        # one job per place: try donors in order until one is exact
+        by_addr = places(jobs_list)
         with tempfile.TemporaryDirectory(prefix="n64dk-transplant-") as tmp:
             def attempt(alts):
                 tried = []
@@ -1290,12 +2026,54 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
                     best["other_attempts"] = [{"donor": r["donor"], "unit": r["donor_unit"], "verdict": r["verdict"]}
                                               for r in tried[1:]]
                 return best
+            base_definitions = {key: set(places_) for key, places_ in xfer["definitions"].items()}
+            groups = list(by_addr.values())
+
+            def solve(pool, banned):
+                """Every place verified, then passes in which what is settled settles more: the
+                units verified exact place their functions and data for the units still waiting
+                (``verified_definitions``), and sections lying end to end settle each other's
+                address (``settle_sections``).  The waiting places are compared again after each
+                pass, for as long as one of them gets further."""
+                xfer.update(definitions={key: set(places_) for key, places_ in base_definitions.items()},
+                            verified={}, defined_as={}, settled={})
+                found = list(pool.map(attempt, groups))
+                for _round in range(MAX_DEFINITION_ROUNDS):
+                    news = verified_definitions(found, xfer["definitions"], xfer["verified"], xfer["defined_as"])
+                    news += len(settle_sections(found, target, xfer["settled"], banned)) if rodata_settlement else 0
+                    waiting = [k for k, row in enumerate(found) if row["verdict"] != EXACT_VERDICT]
+                    if not news or not waiting:
+                        break
+                    again = list(pool.map(attempt, [groups[k] for k in waiting]))
+                    better = [(k, row) for k, row in zip(waiting, again) if _progress(row) > _progress(found[k])]
+                    for k, row in better:
+                        if row["verdict"] == EXACT_VERDICT:
+                            row["notes"].append("settled on a later pass, by what units verified before it define "
+                                                "or by sections lying end to end")
+                        found[k] = row
+                    if not better:
+                        break
+                return found
+
             with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-                rows = list(pool.map(attempt, by_addr.values()))
-            rows = select_rows(rows)
-            settled = settle_rodata(rows, target, starts | (other_starts or set()))
+                banned: set[tuple] = set()
+                for _try in range(MAX_CHAIN_TRIES):
+                    rows = select_rows(solve(pool, banned))
+                    section_chain_list, broken = chain_report(rows, target)
+                    if not broken:
+                        break
+                    banned |= broken                         # the chain did not survive the selection: without it
+            for key, section in broken:                      # (never seen; fail closed if it ever is)
+                for row in rows:
+                    if (row["donor"], row["donor_unit"], row["target_vram"]) == key and row["verdict"] == EXACT_VERDICT:
+                        row["verdict"] = ASSUMED_VERDICT
+                        row["awaiting"] = {section: f"0x{(row.get('_bases') or {}).get(section, 0):08X}"}
+                        row["notes"].append(f"its {section} chain does not hold among the selected rows")
+            settled = (settle_rodata(rows, target, starts | (other_starts or set())) if rodata_settlement
+                       else {"switched_off": True, "promoted": 0})
         for row in rows:
-            row.pop("_object", None)
+            for private in ("_object", "_unit", "_bases", "_defines"):
+                row.pop(private, None)
     t_verify = time.time() - t0 - t_scan
     # symbol transfer precision against the target catalogue (calls) and symbol file (data)
     precision = {"calls": 0, "calls_at_function_start": 0, "data": 0, "data_at_known_symbol": 0,
@@ -1342,6 +2120,7 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
         "bytes_recovered": sum(r["size"] for r in exact_rows),
         "data_unverified_units": sum(1 for r in exact_rows if r.get("data_unverified")),
         "rodata_settlement": settled,
+        "section_chains": section_chain_list,
         "symbol_transfer": {"symbols": len(xfer["symbols"]), "contradictions": len(xfer["contradictions"]),
                             "suspicious": len(xfer["suspicious"]), "precision": precision},
         "timing_s": {"scan": round(t_scan, 2), "verify": round(t_verify, 2)},
@@ -1356,5 +2135,10 @@ def run(target_image: bytes | None, target, functions: list[tuple[str, int, int]
     report["proposed_symbol_count"] = symtext.count("\n") - 2
     if out_dir is not None:
         write_outputs(Path(out_dir), rows, index, target, report, symtext)
+        # every hit with what became of it: the report lists rows and refusals, and a hit that is
+        # neither (a candidate whose unit was not planned) could not be found anywhere
+        (Path(out_dir) / "hits.json").write_text(json.dumps(
+            [{**h.row(), "template": h.template, "placed": h.placed, "unit_functions": len(h.unit["functions"]),
+              "unit_start": f"0x{h.vram - h.function['offset']:08X}"} for h in hits], indent=0))
     report["_symbol_file"] = symtext
     return report

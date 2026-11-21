@@ -21,6 +21,22 @@ class RecipeTest(unittest.TestCase):
         self.assertNotIn("-DNDEBUG", donor.unit_recipe("I", "libgultra_rom", "os/createthread.c")[1])
         self.assertIn("-D_DEBUG", donor.unit_recipe("J", "libgultra_d", "os/createthread.c")[1])
 
+    def test_the_build_that_links_rmon_is_tried_by_default(self):
+        """Sesame Street (KMC, 2.0F) links rmon and the debug-port exception code: its library is the
+        plain ``libgultra`` build (``_FINALROM`` and ``_DEBUG`` undefined, ``NDEBUG`` defined,
+        ``-funsigned-char``), which the ``_rom`` builds compile out."""
+        import argparse
+        from n64dk.commands import sdkdonor
+        parser = argparse.ArgumentParser()
+        sdkdonor.sdk_donor.arguments(parser)
+        defaults = parser.parse_args(["--source", "s", "--out", "o"]).flavours.split(",")
+        self.assertIn("libgultra", defaults)
+        self.assertIn("libultra", defaults)
+        flags = donor.unit_recipe("F", "libgultra", "rmon/rmonmain.c")[1]
+        self.assertIn("-DNDEBUG", flags)
+        self.assertIn("-funsigned-char", flags)
+        self.assertFalse({"-D_FINALROM", "-D_DEBUG"} & set(flags))
+
     def test_the_ido_build_varies_by_directory_and_version(self):
         self.assertEqual(donor.unit_recipe("H", "libultra_rom", "os/createthread.c")[0], "ido5.3")
         self.assertEqual(donor.unit_recipe("H", "libultra_rom", "os/createthread.c")[1][0], "-O1")

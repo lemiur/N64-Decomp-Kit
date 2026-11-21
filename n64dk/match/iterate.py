@@ -34,6 +34,7 @@ behaviour and remain subject to review like any other candidate.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -45,7 +46,9 @@ FAMILIES = ("types", "fields", "casts", "lifetime", "order", "expression", "scop
             "volatile", "globals", "pointer", "control", "callargs",
             # parser-backed families (n64dk.match.astforms); empty when the source cannot be parsed
             "ast-control", "ast-expr", "ast-temp", "ast-inline-temp", "ast-stmt-order", "ast-decl-order",
-            "ast-cast", "ast-block", "ast-sameline")
+            "ast-cast", "ast-block", "ast-sameline",
+            # hand-matching rewrites (n64dk.match.handforms)
+            "hand")
 _EXTENSION_FAMILIES = ("volatile", "globals", "pointer", "control", "callargs")
 _AST_PREFIX = "ast-"
 _DECL = re.compile(r"^(\s+(?:register\s+)?)(s8|u8|s16|u16|s32|u32)(\s+)(\w+)(\s*;.*|\s*=\s*[^;]+;.*)$")
@@ -368,6 +371,20 @@ def variants(source: str, name: str, families=FAMILIES, reach: int = 6) -> list[
                 out.append(Variant(item.label, _AST_PREFIX + item.family, item.source, item.semantic_review))
         except Exception:                                    # a parser problem must never stop the search
             pass
+    if "hand" in families:
+        try:
+            from . import handforms
+            for label, text in handforms.forms_for(handforms.SEARCH_CAUSES, source, name, None, limit=48):
+                out.append(Variant(label, "hand", text, True))
+        except Exception:                                    # a form problem must never stop the search
+            pass
+    if "egraph" in families or os.environ.get("N64DK_EGRAPH") == "1":
+        # bounded equality saturation (n64dk.match.egraph): opt-in only, never a default family
+        try:
+            from . import egraph
+            out += egraph.iterate_variants(source, name)
+        except Exception:
+            pass
     unique, seen = [], {hashlib.sha256(source.encode()).hexdigest()}
     for item in out:
         digest = hashlib.sha256(item.source.encode()).hexdigest()
@@ -449,11 +466,16 @@ def descend(source: str, name: str, evaluate, families=FAMILIES, rounds: int = 8
 
     Each round expands the ``beam`` best sources found so far (neutral ones included, so two
     edits that only help together are reachable), builds every unseen variant in parallel and
-    keeps the best.  Stops at exact, after ``patience`` rounds without a new best score, or
-    when ``budget`` builds are spent."""
+    keeps the best.  Stops at exact, after ``patience`` rounds without a new best score, when
+    ``budget`` builds are spent, or at once when the start already has the lowest rank there is."""
     base = evaluate(source)
     if base.score is None:
         return {"error": base.error or "baseline does not build", "evaluated": 1}
+    # Scores and rank scores are sums of non-negative penalties, so (0, 0) is the lowest rank, and
+    # only a strictly lower rank replaces the best: from there no variant can be adopted, and the
+    # search would spend its budget to return its start (round 12 base bench: 18 searches, 1,982
+    # builds, on one title; the case's outcome is the same without them).
+    floor = _rank(base) <= (0, 0)
     best_source, best, best_path, spent, steps, sensitivity, stale = source, base, [], 1, [], [], 0
     tried = {hashlib.sha256(source.encode()).hexdigest()}
     frontier = [(_rank(base), "", source, base, [])]
@@ -463,14 +485,14 @@ def descend(source: str, name: str, evaluate, families=FAMILIES, rounds: int = 8
     residual_states = {_residual_vector(base)}
     cache_reused = 0
     for round_number in range(1, rounds + 1):
-        if best.exact or spent >= budget or stale >= patience or not frontier:
+        if best.exact or floor or spent >= budget or stale >= patience or not frontier:
             break
         pool = []
         for _score, path, parent, parent_eval, parent_edits in frontier:
             order = _family_order(parent_eval.report, families)
             children = [v for v in variants(parent, name, families)
                         if hashlib.sha256(v.source.encode()).hexdigest() not in tried]
-            children.sort(key=lambda v: order.index(v.family))
+            children.sort(key=lambda v: order.index(v.family) if v.family in order else len(order))
             for child in children[:per_round]:
                 tried.add(hashlib.sha256(child.source.encode()).hexdigest())
                 pool.append((path, child, parent_edits))
@@ -543,6 +565,6 @@ def descend(source: str, name: str, evaluate, families=FAMILIES, rounds: int = 8
             "unique_preprocessed": (len(preprocessed_digests) if preprocessed_digests else None),
             "unique_objects": len(object_digests),
             "object_cache_reused": cache_reused,
-            "stopped_reason": ("exact" if best.exact else "budget" if spent >= budget else
+            "stopped_reason": ("exact" if best.exact else "floor" if floor else "budget" if spent >= budget else
                                "stagnation" if stale >= patience else "exhausted"),
             "semantic_review_required": any(item["semantic_review"] for item in best_path)}

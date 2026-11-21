@@ -6,6 +6,7 @@ project.
 
 ## Environment and capabilities
 
+<!-- example: fixture=project requires=project,slow id=workbench-environment -->
 ```bash
 n64dk doctor --project . --profile matching
 n64dk doctor --project . --profile gpu-research --fix-user
